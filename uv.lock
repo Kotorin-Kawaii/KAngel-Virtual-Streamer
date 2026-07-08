@@ -360,7 +360,7 @@ wheels = [
 ]
 
 [[package]]
-name = "kangel-server"
+name = "kangel-virtual-streamer"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

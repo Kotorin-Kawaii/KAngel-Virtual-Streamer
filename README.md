@@ -10,6 +10,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white&style=flat-square)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-WebSocket-009688?logo=fastapi&logoColor=white&style=flat-square)](https://fastapi.tiangolo.com/)
+[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 
 
 </div>
@@ -46,9 +47,21 @@ KAngel Server 是一个 AI 虚拟主播后端。它不只生成单条回复，�
 ## 快速开始
 
 ```bash
-git clone https://github.com/Kotorin-Kawaii/Kangel-Server.git
-cd Kangel-Server
+git clone https://github.com/Kotorin-Kawaii/KAngel-Virtual-Streamer.git
+cd KAngel-Virtual-Streamer
+```
 
+推荐使用 uv：
+
+```bash
+uv sync
+cp .env.example .env           # Windows 可手动复制
+uv run python main.py
+```
+
+也可以使用传统 pip：
+
+```bash
 python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -117,7 +130,7 @@ STREAM__DAILY_THEMES=[{"id":"chat","name":"互联网杂谈","prompt_hint":"偶�
 ## 项目结构
 
 ```text
-Kangel-Server/
+KAngel-Virtual-Streamer/
 ├── api/          # HTTP 与 WebSocket 路由
 ├── config/       # 配置模型、情绪动作目录
 ├── core/         # 人格、记忆、SC、活动、限流等业务逻辑
@@ -148,9 +161,14 @@ Kangel-Server/
 
 - [完整 HTTP/WebSocket 接口契约](docs/FRONTEND_API.md)
 - [AI 主播状态与思维流程](docs/AI_STREAMER_FLOW.md)
+- [系统架构说明](docs/ARCHITECTURE.md)
+- [部署指南](docs/DEPLOYMENT.md)
 - [登录观众长期记忆](docs/LONG_TERM_MEMORY.md)
 - [记忆隐私与用户控制](docs/MEMORY_PRIVACY.md)
 - [插件开发指南](docs/PLUGIN_GUIDE.md)
+- [贡献指南](CONTRIBUTING.md)
+- [安全策略](SECURITY.md)
+- [更新日志](CHANGELOG.md)
 
 ## 常见问题
 
