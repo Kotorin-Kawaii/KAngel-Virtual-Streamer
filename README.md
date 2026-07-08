@@ -1,6 +1,6 @@
 <div align="center">
 
-# KAngel Server
+# KAngel Virtual Streamer
 
 ### 让 AI 主播拥有连续人格、观众记忆与自己的直播节奏
 
