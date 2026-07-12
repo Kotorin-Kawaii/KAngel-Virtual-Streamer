@@ -1,7 +1,7 @@
 [project]
-name = "kangel-virtual-streamer"
+name = "kangel-server"
 version = "0.1.0"
-description = "AI virtual streamer backend with persistent persona, viewer memory, danmaku WebSocket and OpenAI-compatible model support"
+description = "虚拟主播直播系统 - 支持RAG增强的弹幕回复生成"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,3 +15,17 @@ dependencies = [
     "fastembed>=0.2.0",
     "scikit-learn>=1.3.0",
 ]
+
+[project.scripts]
+kangel-server = "kangel.main:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kangel*"]

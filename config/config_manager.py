@@ -16,7 +16,7 @@ class ConfigManager:
     def _load_config(self):
         """加载配置文件"""
         # 延迟导入logger避免循环导入
-        from utils.logger import logger
+        from kangel.shared.logging import logger
         
         if os.path.exists(self._config_file):
             try:
@@ -31,7 +31,7 @@ class ConfigManager:
     
     def save_config(self):
         """保存配置到文件"""
-        from utils.logger import logger
+        from kangel.shared.logging import logger
         
         try:
             with open(self._config_file, "w", encoding="utf-8") as f:
@@ -55,7 +55,7 @@ class ConfigManager:
     
     def update_settings(self, settings_obj: Settings) -> Settings:
         """从配置文件更新Settings对象"""
-        from utils.logger import logger
+        from kangel.shared.logging import logger
         
         if not self._config_cache:
             return settings_obj
