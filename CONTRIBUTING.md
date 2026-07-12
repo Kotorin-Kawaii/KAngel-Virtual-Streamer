@@ -24,10 +24,10 @@ python main.py
 ## 提交前检查
 
 - 不要提交真实 `.env`、API Key、Cookie、SQLite 数据库、日志或用户数据。
-- 修改 HTTP/WebSocket 字段时，同步更新 `docs/FRONTEND_API.md`。
-- 修改主播状态、记忆、活动或 Prompt 组装时，同步更新 `docs/AI_STREAMER_FLOW.md` 或 `docs/ARCHITECTURE.md`。
+- 修改 HTTP/WebSocket 字段时，同步更新 `docs/api/FRONTEND.md`。
+- 修改主播状态、记忆、活动或 Prompt 组装时，同步更新 `docs/concepts/AI_STREAMER_FLOW.md` 或 `docs/architecture/OVERVIEW.md`。
 - 修改部署方式时，同步更新 `docs/DEPLOYMENT.md`。
-- 修改插件机制时，同步更新 `docs/PLUGIN_GUIDE.md`。
+- 修改插件机制时，同步更新 `docs/plugins/DEVELOPMENT.md`。
 
 ## 代码风格
 

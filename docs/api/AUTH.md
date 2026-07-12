@@ -193,7 +193,7 @@ Authorization: Bearer <access_token>
 
 ## 4. 人物记忆与隐私控制
 
-登录用户可以查询、导出、清除或关闭人物长期记忆。完整请求、响应及脱敏规则见 [账号人物记忆与隐私接口](MEMORY_PRIVACY.md)。
+登录用户可以查询、导出、清除或关闭人物长期记忆。完整请求、响应及脱敏规则见 [账号人物记忆与隐私接口](../concepts/MEMORY_PRIVACY.md)。
 
 主要接口：
 

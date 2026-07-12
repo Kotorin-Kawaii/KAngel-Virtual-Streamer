@@ -43,7 +43,7 @@ uv run python main.py
 - `GET/POST /emotes/**`
 - `WS /danmaku`
 
-完整接口见 [FRONTEND_API.md](FRONTEND_API.md)。
+完整接口见 [前端接口契约](api/FRONTEND.md)。
 
 ## 4. CORS 与登录 Cookie
 

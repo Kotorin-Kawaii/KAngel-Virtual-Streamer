@@ -6,7 +6,7 @@
 
 `FastAPI` · `WebSocket` · `SQLite` · `OpenAI-compatible API`
 
-[在线体验](https://kotorin-kawaii.github.io/KangelAI/) · [接口文档](docs/FRONTEND_API.md) · [思维流程](docs/AI_STREAMER_FLOW.md)
+[在线体验](https://kotorin-kawaii.github.io/KangelAI/) · [接口文档](docs/api/FRONTEND.md) · [思维流程](docs/concepts/AI_STREAMER_FLOW.md)
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white&style=flat-square)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-WebSocket-009688?logo=fastapi&logoColor=white&style=flat-square)](https://fastapi.tiangolo.com/)
@@ -105,10 +105,10 @@ AI__PARALLEL_CONTEXT_ANALYSIS=True
 | 想修改的内容 | 修改位置 | 说明 |
 | :--- | :--- | :--- |
 | 名称、房间主题、初始情绪 | `.env` / `config/settings.py` 的 `PersonaConfig` | 修改 `PERSONA__STREAMER_NAME`、`PERSONA__THEME`、初始 mood/stress/darkness |
-| 核心身份、性格、口癖与偏好 | `utils/streamer_prompt_generator.py` → `_build_system_prompt()` | 最终回复与情感分析共享的核心人格；新角色必须完整替换硬编码设定 |
-| 人物事实与典型问答 | `utils/streamer_prompt_generator.py` → `QA_DATA` | 使用稳定且唯一的 `Qxx` 编号，避免互相冲突或过时的事实 |
-| 数值状态如何影响表达 | `utils/streamer_prompt_generator.py` → `_build_persona_influence_description()` | 定义不同 mood/stress/darkness 区间的语言表现 |
-| 状态衰减、边界与关系权重 | `core/persona_dynamics.py` | 控制长期人格变化，修改后应重点回归测试 |
+| 核心身份、性格、口癖与偏好 | `src/kangel/integrations/ai/prompts.py` → `_build_system_prompt()` | 最终回复与情感分析共享的核心人格；新角色必须完整替换硬编码设定 |
+| 人物事实与典型问答 | `src/kangel/integrations/ai/prompts.py` → `QA_DATA` | 使用稳定且唯一的 `Qxx` 编号，避免互相冲突或过时的事实 |
+| 数值状态如何影响表达 | `src/kangel/integrations/ai/prompts.py` → `_build_persona_influence_description()` | 定义不同 mood/stress/darkness 区间的语言表现 |
+| 状态衰减、边界与关系权重 | `src/kangel/persona/domain/dynamics.py` | 控制长期人格变化，修改后应重点回归测试 |
 | 模型可输出的情绪动作 | `config/emotion_catalog.py` | 前端必须提供对应动作或资源映射 |
 | 每日主题与当前活动 | `.env` 中 `STREAM__DAILY_THEMES`、`STREAM__ACTIVITY_CANDIDATES` | 默认结构位于 `config/settings.py` 的 `StreamConfig` |
 | 立绘、动画、音频和表情资源 | 前端项目 | 后端只发送情绪、文本、活动和表情 ID |
@@ -131,15 +131,15 @@ STREAM__DAILY_THEMES=[{"id":"chat","name":"互联网杂谈","prompt_hint":"偶�
 
 ```text
 KAngel-Virtual-Streamer/
-├── api/          # HTTP 与 WebSocket 路由
-├── config/       # 配置模型、情绪动作目录
-├── core/         # 人格、记忆、SC、活动、限流等业务逻辑
-├── models/       # Pydantic 数据结构
-├── plugins/      # 插件系统与示例
-├── services/     # OpenAI-compatible AI 客户端
-├── utils/        # Prompt、QA 与日志工具
-├── docs/         # 接口与机制文档
-├── main.py       # 应用入口
+├── src/kangel/   # 分层服务端源码
+│   ├── persona/ audience/ memory/ danmaku/ stream/
+│   ├── integrations/       # AI 与 SuperChat
+│   ├── transport/          # HTTP 与 WebSocket
+│   └── infrastructure/     # SQLite、安全、限流与并发
+├── config/       # 正式配置模型与情绪动作目录
+├── plugins/      # 运行时插件发现目录
+├── docs/         # architecture/api/concepts/plugins/deployment
+├── main.py       # 便捷启动入口
 └── .env.example  # 脱敏配置模板
 ```
 
@@ -159,13 +159,13 @@ KAngel-Virtual-Streamer/
 
 ## 文档
 
-- [完整 HTTP/WebSocket 接口契约](docs/FRONTEND_API.md)
-- [AI 主播状态与思维流程](docs/AI_STREAMER_FLOW.md)
-- [系统架构说明](docs/ARCHITECTURE.md)
+- [完整 HTTP/WebSocket 接口契约](docs/api/FRONTEND.md)
+- [AI 主播状态与思维流程](docs/concepts/AI_STREAMER_FLOW.md)
+- [系统架构说明](docs/architecture/OVERVIEW.md)
 - [部署指南](docs/DEPLOYMENT.md)
-- [登录观众长期记忆](docs/LONG_TERM_MEMORY.md)
-- [记忆隐私与用户控制](docs/MEMORY_PRIVACY.md)
-- [插件开发指南](docs/PLUGIN_GUIDE.md)
+- [登录观众长期记忆](docs/concepts/LONG_TERM_MEMORY.md)
+- [记忆隐私与用户控制](docs/concepts/MEMORY_PRIVACY.md)
+- [插件开发指南](docs/plugins/DEVELOPMENT.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 - [更新日志](CHANGELOG.md)
@@ -190,7 +190,7 @@ KAngel-Virtual-Streamer/
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request。涉及协议字段时，请同步更新 `docs/FRONTEND_API.md`；涉及人格、记忆或状态动力学时，请说明行为变化和回归方式。请勿提交真实 `.env`、API Key、SQLite 数据库、日志或用户数据。
+欢迎提交 Issue 和 Pull Request。涉及协议字段时，请同步更新 `docs/api/FRONTEND.md`；涉及人格、记忆或状态动力学时，请说明行为变化和回归方式。请勿提交真实 `.env`、API Key、SQLite 数据库、日志或用户数据。
 
 ## License
 
