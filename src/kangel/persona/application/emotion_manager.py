@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from config.emotion_catalog import AVAILABLE_EMOTIONS
+from config.settings import settings
 from kangel.shared.logging import logger
 
 
@@ -38,23 +39,44 @@ class EmotionItem:
 
 class EmotionManager:
     """情绪管理器"""
-    
-    def __init__(self):
+
+    # 类别语气契合度低于这个值就不进推荐：多样化不能把语气拧反。
+    _CATEGORY_AFFINITY_FLOOR = 0.22
+
+    def __init__(
+        self,
+        diversity_enabled: Optional[bool] = None,
+        cold_bonus: Optional[float] = None,
+    ):
         # 情绪数据库
         self._emotions: Dict[str, EmotionItem] = {}
-        
+
         # 情绪历史记录
         self._recent_emotions: List[str] = []
         self._max_recent_history = 24
         self._lock = RLock()
-        
+
         # 随机强度 0-1，越高越随机
         self._randomness = 0.3
-        
+
+        # 覆盖策略：默认开启，可用 PERSONA__EMOTION_DIVERSITY_ENABLED=false 回到旧打分。
+        persona = getattr(settings, "persona", None)
+        self._diversity_enabled = bool(
+            getattr(persona, "emotion_diversity_enabled", True)
+            if diversity_enabled is None else diversity_enabled
+        )
+        configured_bonus = float(
+            getattr(persona, "emotion_cold_bonus", 1.5)
+            if cold_bonus is None else cold_bonus
+        )
+        self._cold_bonus = configured_bonus if self._diversity_enabled else 0.0
+        # 收紧重复判定：近 10 次里出现 2 次就换同类别的另一个动作。
+        self._overuse_threshold = 2 if self._diversity_enabled else 3
+
         # 初始化情绪库
         self._init_emotion_database()
-        
-        logger.info("✅ 情绪管理器初始化成功")
+
+        logger.info("情绪管理器初始化成功")
     
     def _init_emotion_database(self):
         """初始化情绪数据库"""
@@ -65,8 +87,6 @@ class EmotionManager:
             EmotionItem("卖萌", EmotionCategory.POSITIVE, mood_bonus=1.5, description="可爱的卖萌表情"),
             EmotionItem("兴奋", EmotionCategory.POSITIVE, mood_bonus=2.0, description="兴奋、激动的情绪"),
             EmotionItem("温柔", EmotionCategory.POSITIVE, mood_bonus=1.5, description="温柔、体贴的情绪"),
-            EmotionItem("亢奋", EmotionCategory.POSITIVE, mood_bonus=1.5, stress_bonus=0.7, description="高涨、亢奋的情绪"),
-            EmotionItem("大笑", EmotionCategory.POSITIVE, mood_bonus=1.7, description="放声大笑的情绪"),
 
             EmotionItem("害羞", EmotionCategory.INTIMATE_PERFORMANCE, mood_bonus=1.0, description="害羞、腼腆的表现"),
             EmotionItem("撒娇", EmotionCategory.INTIMATE_PERFORMANCE, mood_bonus=1.4, description="亲昵撒娇的表现"),
@@ -74,7 +94,6 @@ class EmotionManager:
             EmotionItem("做作", EmotionCategory.INTIMATE_PERFORMANCE, mood_bonus=0.4, darkness_bonus=0.5, description="刻意夸张的表演"),
             EmotionItem("帅气", EmotionCategory.INTIMATE_PERFORMANCE, mood_bonus=1.0, description="自信帅气的表现"),
             EmotionItem("打招呼", EmotionCategory.INTIMATE_PERFORMANCE, mood_bonus=0.8, description="主动打招呼的动作"),
-            EmotionItem("笑着挥手", EmotionCategory.INTIMATE_PERFORMANCE, mood_bonus=1.2, description="微笑着挥手的动作"),
 
             EmotionItem("生气", EmotionCategory.NEGATIVE, stress_bonus=1.8, description="生气、愤怒的情绪"),
             EmotionItem("委屈", EmotionCategory.NEGATIVE, stress_bonus=1.2, description="委屈、难过的情绪"),
@@ -82,15 +101,13 @@ class EmotionManager:
             EmotionItem("尴尬", EmotionCategory.NEGATIVE, stress_bonus=1.0, description="尴尬、难为情的情绪"),
             EmotionItem("伤心", EmotionCategory.NEGATIVE, stress_bonus=1.5, description="伤心、难过的情绪"),
             EmotionItem("焦虑", EmotionCategory.NEGATIVE, stress_bonus=1.5, description="焦虑、担忧的情绪"),
-            EmotionItem("困倦", EmotionCategory.NEGATIVE, stress_bonus=0.7, description="困倦、想睡的状态"),
             EmotionItem("疲惫", EmotionCategory.NEGATIVE, stress_bonus=1.2, description="疲惫、劳累的状态"),
             EmotionItem("厌恶", EmotionCategory.NEGATIVE, stress_bonus=1.6, darkness_bonus=0.5, description="厌恶、排斥的情绪"),
             EmotionItem("害怕", EmotionCategory.NEGATIVE, stress_bonus=1.8, description="害怕、恐惧的情绪"),
 
             EmotionItem("阴暗", EmotionCategory.INTENSE_DARK, darkness_bonus=2.0, description="阴暗、消极的情绪"),
             EmotionItem("暴怒", EmotionCategory.INTENSE_DARK, darkness_bonus=1.5, stress_bonus=1.5, description="暴怒、狂怒的情绪"),
-            EmotionItem("毒舌", EmotionCategory.INTENSE_DARK, darkness_bonus=1.8, description="毒舌、尖刻的表现"),
-            EmotionItem("嘲讽", EmotionCategory.INTENSE_DARK, darkness_bonus=1.5, description="嘲讽、挖苦的表现"),
+            EmotionItem("嘲讽", EmotionCategory.INTENSE_DARK, darkness_bonus=1.5, description="嘲讽、挖苦、毒舌的表现"),
             EmotionItem("崩溃", EmotionCategory.INTENSE_DARK, darkness_bonus=1.4, stress_bonus=1.8, description="情绪崩溃的强烈表现"),
             EmotionItem("冷笑", EmotionCategory.INTENSE_DARK, darkness_bonus=1.5, description="冷笑、讥讽的表现"),
             EmotionItem("震惊", EmotionCategory.INTENSE_DARK, stress_bonus=1.2, description="强烈震惊的情绪"),
@@ -212,27 +229,156 @@ class EmotionManager:
         category: Optional[EmotionCategory] = None,
         excluded: Optional[Set[str]] = None,
     ) -> List[str]:
-        """按状态与近期频率确定性排序，不提前写入使用历史。"""
+        """按状态、近期频率与冷门程度确定性排序，不提前写入使用历史。"""
         excluded = excluded or set()
         recent = self.get_recent_emotions(10)
         frequencies = Counter(recent)
+        staleness = self._staleness_map()
         last = recent[-1] if recent else None
-        scored = []
+        base = {
+            name: self._state_score(item, mood, stress, darkness)
+            for name, item in self._emotions.items()
+        }
+        peak = self._category_peaks(base)
+        scored: List[Tuple[float, str, EmotionCategory]] = []
         for name, item in self._emotions.items():
             if name in excluded or (category and item.category != category):
                 continue
-            score = (
-                item.weight
-                + item.mood_bonus * mood
-                + item.stress_bonus * stress
-                + item.darkness_bonus * darkness
-            )
+            if self._diversity_enabled:
+                # 类别内归一化后再叠加冷门加成：否则「零加成的中性动作」永远比
+                # 「带 2.0 心情加成的正向情绪」低一截，无论多久没用都排不上来。
+                fit = base[name] / (peak[item.category] or 1.0)
+                score = fit + self._cold_bonus * staleness.get(name, 1.0)
+            else:
+                score = base[name]
             score /= 1.0 + frequencies[name] * 2.5
             if name == last:
                 score *= 0.12
-            scored.append((score, name))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [name for _, name in scored[:max(0, count)]]
+            scored.append((score, name, item.category))
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        limit = max(0, count)
+        # 指定类别时（替换同类动作）保持纯排序，不再二次分配名额。
+        if category or not self._diversity_enabled:
+            return [name for _, name, _ in scored[:limit]]
+        return self._spread_across_categories(scored, mood, stress, darkness, limit)
+
+    @staticmethod
+    def _state_score(
+        item: EmotionItem, mood: float, stress: float, darkness: float
+    ) -> float:
+        return (
+            item.weight
+            + item.mood_bonus * mood
+            + item.stress_bonus * stress
+            + item.darkness_bonus * darkness
+        )
+
+    def _category_peaks(self, base: Dict[str, float]) -> Dict[EmotionCategory, float]:
+        peaks: Dict[EmotionCategory, float] = {}
+        for name, item in self._emotions.items():
+            peaks[item.category] = max(peaks.get(item.category, 0.0), base[name])
+        return peaks
+
+    def _staleness_map(self) -> Dict[str, float]:
+        """按最后一次出现的位置给出 0-1 的冷门程度；未出现过的取 1.0。"""
+        window = self.get_recent_emotions(self._max_recent_history)
+        if not window:
+            return {}
+        span = float(len(window))
+        last_seen = {name: index for index, name in enumerate(window)}
+        return {
+            name: (span - 1 - index) / span
+            for name, index in last_seen.items()
+        }
+
+    def _category_affinity(
+        self, category: EmotionCategory, mood: float, stress: float, darkness: float
+    ) -> float:
+        """当前状态下这一类表达是否说得过去；决定它能分到几个推荐位。"""
+        if category is EmotionCategory.POSITIVE:
+            return mood
+        if category is EmotionCategory.INTIMATE_PERFORMANCE:
+            return 0.25 + 0.55 * mood
+        if category is EmotionCategory.NEGATIVE:
+            # 心情好且不紧绷时归零，避免把负向动作推给欢快的语境。
+            return max(0.0, 0.7 * stress + 0.6 * (0.5 - mood))
+        if category is EmotionCategory.INTENSE_DARK:
+            return max(0.0, 0.65 * darkness + 0.5 * stress - 0.35 * mood)
+        # 中性动作（认真/思考/眼神飘忽等）与任何语气都兼容，恒定可用。
+        return 0.45
+
+    def _spread_across_categories(
+        self,
+        scored: List[Tuple[float, str, EmotionCategory]],
+        mood: float,
+        stress: float,
+        darkness: float,
+        limit: int,
+    ) -> List[str]:
+        """按类别语气契合度分配名额，每类内部再取前几名。
+
+        纯线性打分会让状态决定的同一簇永远占满推荐位（实测六种状态合计只能推出
+        18/34 个标定，全部中性动作永远垫底）。这里改成先给说得通的类别分名额，
+        再在类别内部取高分项：既保住语气正确，又让模型每轮都看到多种表达。
+        """
+        buckets: Dict[EmotionCategory, List[Tuple[float, str]]] = {}
+        for score, name, category in scored:
+            buckets.setdefault(category, []).append((score, name))
+        if not buckets or limit <= 0:
+            return []
+        affinity = {
+            category: self._category_affinity(category, mood, stress, darkness)
+            for category in buckets
+        }
+        plausible = [
+            category for category in buckets
+            if affinity[category] >= self._CATEGORY_AFFINITY_FLOOR
+        ] or list(buckets)
+        order = sorted(
+            plausible,
+            key=lambda category: (-affinity[category], category.value),
+        )
+        total_affinity = sum(affinity[category] for category in order) or 1.0
+        quota = {
+            category: max(1, round(limit * affinity[category] / total_affinity))
+            for category in order
+        }
+        picked: List[Tuple[float, str]] = []
+        for category in order:
+            picked.extend(buckets[category][:quota[category]])
+        if len(picked) > limit:
+            # 名额取整可能超发：整体按分数截断，保留分数最高的 limit 个。
+            picked.sort(key=lambda row: (-row[0], row[1]))
+            picked = picked[:limit]
+        elif len(picked) < limit:
+            # 名额不足时按契合度顺序补足，绝不越过语气过滤。
+            taken = {name for _, name in picked}
+            for category in order:
+                for row in buckets[category]:
+                    if len(picked) >= limit:
+                        break
+                    if row[1] not in taken:
+                        picked.append(row)
+                        taken.add(row[1])
+                if len(picked) >= limit:
+                    break
+        # 名额决定「有哪些」，分数决定「谁排在前面」。模型对列表头部有明显的锚定
+        # 倾向，所以冷门项必须能靠分数抢到头部，否则配额只是把它们排到看不见的尾部。
+        picked.sort(key=lambda row: (-row[0], row[1]))
+        return [name for _, name in picked]
+
+    def _cold_emotions(
+        self, mood: float, stress: float, darkness: float, count: int = 8
+    ) -> List[str]:
+        """近期完全没出现、且语气说得过去的标定，用来给模型正向拉动。"""
+        window = set(self.get_recent_emotions(self._max_recent_history))
+        cold = {name for name in self._emotions if name not in window}
+        if not cold:
+            return []
+        return self.recommend_emotions(
+            mood, stress, darkness, count=count,
+            excluded=set(self._emotions) - cold,
+        )
 
     def build_prompt_context(self, mood: float, stress: float, darkness: float) -> Dict:
         """构建供回复模型阅读的近期情绪使用上下文。"""
@@ -240,15 +386,17 @@ class EmotionManager:
         frequencies = Counter(recent)
         overused = [
             name for name, frequency in frequencies.most_common()
-            if frequency >= 3 or (recent and recent[-1] == name and frequency >= 2)
+            if frequency >= self._overuse_threshold + 1
+            or (recent and recent[-1] == name and frequency >= self._overuse_threshold)
         ]
         return {
             "recent_emotions": recent,
             "frequency": dict(frequencies),
             "overused_emotions": overused,
             "recommended_emotions": self.recommend_emotions(
-                mood, stress, darkness, count=6
+                mood, stress, darkness, count=8
             ),
+            "unused_emotions": self._cold_emotions(mood, stress, darkness, count=8),
             "available_emotions": self.get_available_emotions(),
         }
 
@@ -300,7 +448,10 @@ class EmotionManager:
     def _is_overused(self, emotion: str, recent: List[str], frequencies: Counter) -> bool:
         if not emotion or emotion not in self._emotions:
             return True
-        return (bool(recent) and recent[-1] == emotion) or frequencies[emotion] >= 3
+        return (
+            (bool(recent) and recent[-1] == emotion)
+            or frequencies[emotion] >= self._overuse_threshold
+        )
 
     def _is_state_critical(self, emotion: str, mood: float, stress: float, darkness: float) -> bool:
         return (
@@ -401,6 +552,10 @@ class EmotionManager:
             "category_counts": category_counts,
             "recent_emotions": recent,
             "recent_frequency": dict(Counter(recent)),
+            "recent_distinct": len(set(recent)),
+            "recent_coverage": round(len(set(recent)) / max(1, len(self._emotions)), 4),
+            "diversity_enabled": self._diversity_enabled,
+            "cold_bonus": self._cold_bonus,
             "randomness": self._randomness,
             "available_emotions": list(self._emotions.keys())
         }

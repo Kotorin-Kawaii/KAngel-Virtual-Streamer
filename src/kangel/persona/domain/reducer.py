@@ -1,6 +1,6 @@
 """人格事件的无副作用确定性归约器。"""
 
-from .dynamics import clamp, toward
+from .dynamics import DynamicsContext, PersonaDynamicsTuning, clamp, toward
 from .events import (
     AudienceAtmosphereTickEvent,
     DanmakuReceivedEvent,
@@ -18,8 +18,13 @@ from .state import EmotionDelta, InternalPersonaState, InternalStateDelta, Perso
 class PersonaEventReducer:
     """模型解释语义，归约器只计算有界状态变化。"""
 
-    def __init__(self, baseline: PersonaState | None = None):
+    def __init__(
+        self,
+        baseline: PersonaState | None = None,
+        tuning: PersonaDynamicsTuning | None = None,
+    ):
         self.baseline = baseline or PersonaState()
+        self.tuning = tuning or PersonaDynamicsTuning()
 
     def reduce(
         self,
@@ -108,26 +113,32 @@ class PersonaEventReducer:
         state: PersonaState,
         internal_state: InternalPersonaState,
     ) -> PersonaMutation:
-        if event.seconds_since_activity < 30:
+        if event.seconds_since_activity < self.tuning.silence_min_activity_seconds:
             return PersonaMutation(reason="静默时间不足，不更新状态")
-        factor = min(max(event.seconds_since_activity / 30.0, 1.0), 4.0)
-        mood_delta = (self.baseline.mood - state.mood) * 0.006 * factor
-        stress_delta = (self.baseline.stress - state.stress) * 0.009 * factor
-        darkness_delta = (self.baseline.darkness - state.darkness) * 0.005 * factor
-        if event.seconds_since_activity >= 120:
-            mood_delta -= 0.0015
-            stress_delta += 0.001
+        factor = min(
+            max(event.seconds_since_activity / self.tuning.silence_factor_reference_seconds, 1.0),
+            self.tuning.silence_factor_max,
+        )
+        mood_delta = (self.baseline.mood - state.mood) * self.tuning.silence_recovery_mood * factor
+        stress_delta = (self.baseline.stress - state.stress) * self.tuning.silence_recovery_stress * factor
+        darkness_delta = (self.baseline.darkness - state.darkness) * self.tuning.silence_recovery_darkness * factor
+        if event.seconds_since_activity >= self.tuning.silence_cold_room_seconds:
+            mood_delta += self.tuning.silence_cold_room_mood_delta
+            stress_delta += self.tuning.silence_cold_room_stress_delta
         return PersonaMutation(
             emotion_delta=EmotionDelta(
-                mood=clamp(mood_delta, -0.02, 0.02),
-                stress=clamp(stress_delta, -0.025, 0.025),
-                darkness=clamp(darkness_delta, -0.015, 0.015),
+                mood=clamp(mood_delta, -self.tuning.silence_max_delta_mood, self.tuning.silence_max_delta_mood),
+                stress=clamp(stress_delta, -self.tuning.silence_max_delta_stress, self.tuning.silence_max_delta_stress),
+                darkness=clamp(darkness_delta, -self.tuning.silence_max_delta_darkness, self.tuning.silence_max_delta_darkness),
             ),
             internal_delta=InternalStateDelta(
                 arousal=toward(internal_state.arousal, 0.35, 0.012 * factor),
                 fatigue=toward(internal_state.fatigue, 0.2, 0.010 * factor),
-                attachment=-0.0005 if event.seconds_since_activity >= 120 else 0.0,
+                attachment=-0.0005 if event.seconds_since_activity >= self.tuning.silence_cold_room_seconds else 0.0,
                 confidence=toward(internal_state.confidence, 0.65, 0.003 * factor),
+            ),
+            dynamics_context=DynamicsContext(
+                source="silence", silence_seconds=event.seconds_since_activity,
             ),
             reason="直播间静默时执行自然恢复与轻微冷场反应",
         )

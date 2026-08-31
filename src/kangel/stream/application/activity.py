@@ -55,9 +55,10 @@ class StreamerActivityService:
         stream_session_id: str,
         theme_id: str,
         started_at: str,
+        continuity_activity_id: str | None = None,
     ) -> StreamerActivityState:
         """同一场次只初始化一次；并发和重启均读取数据库中的既有事实。"""
-        chosen = self._choose(stream_session_id, theme_id)
+        chosen = self._choose(stream_session_id, theme_id, continuity_activity_id)
         now = datetime.now().astimezone().isoformat()
         with self.database._get_connection() as conn:
             conn.execute("""
@@ -130,6 +131,45 @@ class StreamerActivityService:
         audience_sentiment: float = 0.0,
     ) -> StreamerActivityState | None:
         """确定性评估静默切换；返回 None 表示继续当前活动或版本冲突。"""
+        proposal = self.propose_switch(
+            current=current, theme_id=theme_id, now=now, mood=mood,
+            stress=stress, fatigue=fatigue, danmaku_rate=danmaku_rate,
+            switch_cooldown_minutes=switch_cooldown_minutes,
+            max_duration_minutes=max_duration_minutes,
+            busy_rate_threshold=busy_rate_threshold,
+            allow_public_performance=allow_public_performance,
+            darkness=darkness, arousal=arousal,
+            audience_sentiment=audience_sentiment,
+        )
+        if not proposal:
+            return None
+        return self.switch_to_candidate(
+            current=current,
+            candidate=proposal["candidate"],
+            changed_at=proposal["changed_at"],
+            trigger_source=proposal["reason_code"],
+            public_performance=proposal["public_performance"],
+        )
+
+    def propose_switch(
+        self,
+        *,
+        current: StreamerActivityState,
+        theme_id: str,
+        now: datetime,
+        mood: float,
+        stress: float,
+        fatigue: float,
+        danmaku_rate: int,
+        switch_cooldown_minutes: int,
+        max_duration_minutes: int,
+        busy_rate_threshold: int,
+        allow_public_performance: bool = False,
+        darkness: float = 0.0,
+        arousal: float = 0.5,
+        audience_sentiment: float = 0.0,
+    ) -> dict | None:
+        """只提出确定性候选，不写事实；供 legacy 与 Director 对照复用。"""
         if current.ended_at or danmaku_rate >= busy_rate_threshold:
             return None
         started = datetime.fromisoformat(current.started_at)
@@ -179,13 +219,49 @@ class StreamerActivityService:
         ).digest()
         chosen = ordered[int.from_bytes(digest[:4], "big") % len(ordered)]
         changed_at = reference.isoformat()
-        return self.switch_to_candidate(
-            current=current,
-            candidate=chosen,
-            changed_at=changed_at,
-            trigger_source=reason,
-            public_performance=(reason == "max_duration" and allow_public_performance),
+        return {
+            "candidate": dict(chosen),
+            "reason_code": reason,
+            "changed_at": changed_at,
+            "public_performance": bool(
+                reason == "max_duration" and allow_public_performance
+            ),
+        }
+
+    def get_candidate(self, activity_id: str | None) -> dict | None:
+        if not activity_id:
+            return None
+        item = next(
+            (candidate for candidate in self.candidates if candidate["id"] == activity_id),
+            None,
         )
+        return dict(item) if item else None
+
+    def validate_switch_target(
+        self,
+        *,
+        current: StreamerActivityState,
+        target_activity_id: str | None,
+        theme_id: str,
+        now: datetime,
+        switch_cooldown_minutes: int,
+    ) -> dict | None:
+        """校验外部候选，但仍由 Activity 目录和持续时间规则拥有最终决定权。"""
+        candidate = self.get_candidate(target_activity_id)
+        if (
+            not candidate or current.ended_at
+            or candidate["id"] == current.activity_id
+            or not (theme_id in candidate["theme_ids"] or "*" in candidate["theme_ids"])
+        ):
+            return None
+        reference = now if now.tzinfo else now.astimezone()
+        started = datetime.fromisoformat(current.started_at)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=reference.tzinfo)
+        elapsed_minutes = max(0.0, (reference - started).total_seconds() / 60)
+        if elapsed_minutes < max(current.min_duration_minutes, switch_cooldown_minutes):
+            return None
+        return candidate
 
     def switch_to_candidate(
         self, *, current: StreamerActivityState, candidate: dict,
@@ -293,12 +369,22 @@ class StreamerActivityService:
             """, (stream_session_id, limit)).fetchall()
         return [dict(row) for row in rows]
 
-    def _choose(self, session_id: str, theme_id: str) -> dict:
+    def _choose(
+        self, session_id: str, theme_id: str, continuity_activity_id: str | None = None,
+    ) -> dict:
         matching = [
             item for item in self.candidates if theme_id in item["theme_ids"]
         ] or [item for item in self.candidates if "*" in item["theme_ids"]]
         if not matching:
             matching = [_FALLBACK]
+        # 上一场总结只能延续仍适用于当前主题的既有目录对象；不能绕过目录、
+        # 特殊日期主题或新场已持久化事实。
+        if continuity_activity_id:
+            continued = next(
+                (item for item in matching if item["id"] == continuity_activity_id), None
+            )
+            if continued:
+                return continued
         ordered = sorted(matching, key=lambda item: item["id"])
         digest = hashlib.sha256(
             f"kangel-activity:{session_id}:{theme_id}".encode("utf-8")

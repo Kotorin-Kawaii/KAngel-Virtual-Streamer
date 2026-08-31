@@ -2,7 +2,7 @@
 
 本文档面向前端开发 agent，覆盖当前后端全部 HTTP 路由、WebSocket 收发事件、认证方式、字段类型、状态码和接入时序。
 
-> 对应后端状态：2026-07-03，P4 直播排期与每日主题、P10/P12 已完成。
+> 对应 v0.3.0 后端状态：2026-08-31。WebSocket 事件的权威清单见 [`WEBSOCKET_EVENTS.md`](WEBSOCKET_EVENTS.md)；本文保留字段类型、HTTP 契约与接入细节。
 
 ## 1. 基础约定
 
@@ -23,7 +23,7 @@ Swagger UI：http://localhost:8000/docs
 AUTH__COOKIE_SECURE=true
 ```
 
-跨域部署时，后端 `CORS__ALLOWED_ORIGINS` 必须包含前端的精确 Origin（协议、域名和端口），例如 `https://kangel.kotorin.cn`。前端请求认证接口时设置 `credentials: "include"`；服务端允许凭据，因此不会接受 `*` 来源。
+跨域部署时，后端 `CORS__ALLOWED_ORIGINS` 必须包含前端的精确 Origin（协议、域名和端口），例如 `https://frontend.example.com`。前端请求认证接口时设置 `credentials: "include"`；服务端允许凭据，因此不会接受 `*` 来源。请将示例域名替换为你自己的前端 Origin。
 
 当前 GitHub Pages 前端是跨站部署，登录 Cookie 使用 `HttpOnly; Secure; SameSite=None; Partitioned`（CHIPS）。`AUTH__COOKIE_DOMAIN` 默认留空，Cookie 只发送回 API 域名且按顶级站点分区；不要由前端读取或复制令牌。
 
@@ -75,7 +75,7 @@ type HttpError = {
 | 层级 | 接口 | 前端用途 |
 |---|---|---|
 | 产品核心 | `/auth/**`、`/stream/metadata`、`/persona/state`、`/emotion/list`、`/danmaku` WebSocket | 登录、账号设置、直播页和弹幕互动 |
-| 可选展示 | `/status`、`/stream/activities`、`/memory/hot-topics` | 状态页、直播间辅助信息 |
+| 可选展示 | `/status`、`/stream/activities`、`/memory/context` | 状态页、直播间辅助信息 |
 | 内部管理/调试 | `/config`、`/plugins/**`、`/connections`、`/database/**`、`/persona/impact/**`、大部分 `/memory/**` 和 `/emotion/**` 写接口 | 仅后台工具，不应进入公开用户前端 |
 
 内部管理/调试接口默认关闭并返回 `404`。仅当服务端显式设置 `ADMIN__ENABLED=true` 且配置独立 `ADMIN__API_KEY` 后，才接受 `Authorization: Bearer <admin-key>` 或 `X-Admin-Key`；普通用户访问令牌和 Cookie 不能调用。`/config` 中密钥使用掩码序列化，前端仍不得保存或记录管理响应。
@@ -87,7 +87,8 @@ type HttpError = {
 注册和登录成功后，服务端同时：
 
 1. 在 JSON 中返回不透明 `access_token`；
-2. 设置同值的 `HttpOnly` Cookie，默认名为 `kangel_access_token`。
+2. 设置同值的 `HttpOnly` access Cookie，默认名为 `kangel_access_token`；
+3. 设置仅随 `POST /auth/refresh` 发送的 `HttpOnly` refresh Cookie，默认名为 `kangel_refresh_token`。
 
 ```ts
 type Account = {
@@ -106,7 +107,7 @@ type AuthTokenResponse = {
 };
 ```
 
-推荐同源浏览器只使用 HttpOnly Cookie，不把 Token 写入 `localStorage`。若使用 Cookie，HTTP 请求需要：
+JSON 中的 `access_token` 仅为 CLI、原生客户端和跨域调试的 Bearer 方式保留。浏览器前端必须忽略该字段，不得把 token 写入 `localStorage`、`sessionStorage`、IndexedDB 或持久化状态。推荐浏览器只使用 `HttpOnly` Cookie。若使用 Cookie，HTTP 请求需要：
 
 ```ts
 fetch(url, {
@@ -137,7 +138,7 @@ WebSocket 按以下顺序取令牌：
 const ws = new WebSocket("ws://localhost:8000/danmaku");
 ```
 
-没有令牌时作为游客连接；携带无效或过期令牌时不会降级为游客，而是以 WebSocket 关闭码 `1008` 拒绝。
+没有令牌时作为游客连接；携带无效或过期令牌时也会安全降级为游客。需要恢复登录身份时，应先按上文流程刷新 HTTP 会话，再关闭旧连接并重新建立 WebSocket。
 
 ## 4. 产品核心 HTTP 接口
 
@@ -217,9 +218,57 @@ type LoginRequest = {
 
 错误：`401` 用户名不存在或密码错误，两者统一返回 `用户名或密码错误`；`422` 格式错误；`429 RateLimitError` 登录尝试过于频繁。
 
-当前没有登出、刷新令牌、修改密码或找回密码接口。
+当前没有登出、修改密码或找回密码接口。
 
-### 4.3 修改昵称
+### 4.3 刷新浏览器会话
+
+`POST /auth/refresh`
+
+认证：只接受浏览器自动携带的 refresh Cookie；没有请求体，不能用 Bearer 或 access token 刷新。
+
+```ts
+type AuthRefreshResponse = {
+  account: Account;
+  expires_at: ISODateTime; // 新 access token 的到期时间
+};
+```
+
+成功：`200 AuthRefreshResponse`，并重新设置两个 `HttpOnly` Cookie。响应不包含 access 或 refresh token。refresh Cookie 默认有效期 720 小时、Path 是 `/auth/refresh`，且为一次性令牌：每次成功刷新都会轮换，旧值立即失效。
+
+失败：`401` 表示 refresh Cookie 缺失、无效、过期或已经使用。`401` 以外的网络错误、`429` 或 `5xx` 不代表用户退出登录。
+
+浏览器登录态恢复只允许一次刷新和一次 profile 重试，避免循环：
+
+```ts
+async function restoreSession(reconnectDanmaku: () => void): Promise<Account | null> {
+  let profile = await fetch("/auth/profile", { credentials: "include" });
+  if (profile.status === 401) {
+    const refresh = await fetch("/auth/refresh", {
+      method: "POST",
+      credentials: "include",
+    });
+    if (refresh.status === 401) return null;
+    if (refresh.status !== 200) throw new Error("refresh request failed");
+    profile = await fetch("/auth/profile", { credentials: "include" });
+  }
+  if (profile.status === 401) return null;
+  if (profile.status !== 200) throw new Error("profile request failed");
+  const account = await profile.json() as Account;
+  reconnectDanmaku(); // 先关闭旧连接，再 new WebSocket("/danmaku")
+  return account;
+}
+```
+
+只有 refresh 或这次 profile 重试也返回 `401` 时才清除登录 UI、要求重新登录。WebSocket 重连必须在 profile 重试成功后执行，确保握手携带新 access Cookie。
+
+### 4.4 当前登录账号
+
+`GET /auth/profile`
+
+认证：登录账号。返回当前 Cookie 或 Bearer 令牌对应的 `Account`，不返回访问令牌。
+浏览器应在页面启动时以 `credentials: "include"` 调用此接口恢复登录态；首次 `401` 时按 4.3 调用 refresh 并重试 profile 一次，只有 refresh 或重试仍为 `401` 才表示本地展示缓存应清除。`429`、`408`、`504` 或网络错误均不得视为退出登录。
+
+### 4.5 修改昵称
 
 `PATCH /auth/profile/nickname`
 
@@ -235,7 +284,7 @@ type NicknameUpdateRequest = {
 
 作用：原子结束旧昵称版本并创建新版本；`account_id`、关系和长期记忆不变。该账号已有 WebSocket 会立即使用新昵称。
 
-### 4.4 查询昵称历史
+### 4.6 查询昵称历史
 
 `GET /auth/profile/nickname-history`
 
@@ -256,7 +305,7 @@ type NicknameHistoryResponse = {
 };
 ```
 
-### 4.5 删除旧昵称版本
+### 4.7 删除旧昵称版本
 
 `DELETE /auth/profile/nickname-history/{version}`
 
@@ -268,7 +317,7 @@ type NicknameHistoryResponse = {
 
 作用：物理删除旧昵称版本。当前昵称不能通过此接口删除。
 
-### 4.6 人物记忆类型
+### 4.8 人物记忆类型
 
 ```ts
 type RelationshipMemory = {
@@ -349,7 +398,7 @@ type AccountMemoryResponse = {
 };
 ```
 
-### 4.7 查询人物记忆
+### 4.9 查询人物记忆
 
 `GET /auth/profile/memory`
 
@@ -357,7 +406,7 @@ type AccountMemoryResponse = {
 
 成功：`200 AccountMemoryResponse`。最多返回近期活跃对话和话题摘要；没有记忆时关系为 `null`、数组为空。
 
-### 4.8 导出人物记忆
+### 4.10 导出人物记忆
 
 `GET /auth/profile/memory/export`
 
@@ -372,7 +421,7 @@ type AccountMemoryExportResponse = AccountMemoryResponse & {
 
 与普通查询不同，导出包含允许保留的活跃及归档对话。响应是 JSON，不是文件流；前端如需下载，应自行创建 `Blob`。
 
-### 4.9 开启或退出长期记忆
+### 4.11 开启或退出长期记忆
 
 `PUT /auth/profile/memory/preferences`
 
@@ -392,7 +441,7 @@ type MemoryPreferenceResponse = {
 
 设置为 `false` 会立即清除已有关系、对话片段和话题摘要，并阻止后续持久化；重新开启不会恢复已删除内容。
 
-### 4.10 清除已有记忆
+### 4.12 清除已有记忆
 
 `DELETE /auth/profile/memory`
 
@@ -402,7 +451,7 @@ type MemoryPreferenceResponse = {
 
 只清除已有记忆，记忆开关保持不变；若希望清除后不再写入，应调用偏好接口关闭长期记忆。
 
-### 4.11 服务状态
+### 4.13 服务状态
 
 `GET /`
 
@@ -425,7 +474,7 @@ type ServerStatus = {
 };
 ```
 
-### 4.12 当前人格状态
+### 4.14 当前人格状态
 
 `GET /persona/state`
 
@@ -441,7 +490,7 @@ type PersonaStateResponse = {
 };
 ```
 
-### 4.13 当前直播元数据
+### 4.15 当前直播元数据
 
 `GET /stream/metadata`
 
@@ -469,10 +518,47 @@ type StreamMetadata = {
   daily_theme_date: string; // schedule_timezone 下的 YYYY-MM-DD
   theme_config_valid: boolean;
   theme_errors: string[];
+  special_date_theme: SpecialDateTheme | null;
+  stream_session_id: string | null;      // 等于 current_stream_start_time；下播为 null
+  session_theme: SessionTheme | null;    // 本场冻结主题；配置热更新不改写
+  daily_stream_plan: DailyStreamPlan | null;
+  current_mainline_beat: MainlineBeat | null;
+  mainline_config_valid: boolean;
+  mainline_errors: string[];
   current_activity: StreamerActivity | null;
   activity_config_valid: boolean;
   activity_errors: string[];
+  streamer_idle_state: StreamerIdleState | null;
   extra: Record<string, unknown>;
+};
+
+type SessionTheme = {
+  id: string;
+  name: string;
+  date: string; // schedule_timezone 下的 YYYY-MM-DD
+};
+
+type DailyStreamPlan = {
+  profile_id: string;
+  version: number;   // Plan 版本；本场内恒定
+  direction: string; // 一句话的本场方向，可展示
+};
+
+type MainlineBeat = {
+  id: string;
+  kind: "opening" | "mainline" | "detour" | "transition" | "wrap_up";
+  label: string;
+  return_to: string | null; // 仅 detour 有值
+  version: number;          // 与 Plan 版本相互独立，单调递增
+  started_at: ISODateTime;
+};
+
+type SpecialDateTheme = {
+  id: string;
+  name: string;
+  title: string;
+  frontend_theme: string | null;
+  date: string; // schedule_timezone 下的 YYYY-MM-DD
 };
 
 type StreamerActivity = {
@@ -483,11 +569,26 @@ type StreamerActivity = {
   started_at: ISODateTime;
   version: number;
 };
+
+type StreamerIdleState = {
+  idle_state: string;
+  idle_text: string;
+  frontend_animation: string;
+  background_music_hint: string | null;
+  priority: number;
+  version: number;
+};
 ```
 
 `is_live` 和 `stream_status` 由后端按排期计算，不代表服务器进程是否运行。每日主题及当前具体活动均由后端选择；前端必须直接消费这些字段，不自行按浏览器时区、本地随机数或主题名称推算。下播时 `current_activity=null`。
 
-### 4.14 最近进出活动
+`special_date_theme` 是当天特殊日期的安全展示摘要；为 `null` 时沿用普通每日主题。前端可根据 `frontend_theme` 点缀页面，未知 ID 或缺失值必须回退普通展示，不能自行推断节日或向用户展示服务端提示词/人格 bias。
+
+主线字段（P26）在 `STREAM__MAINLINE_ENABLED=false` 时恒为 `null`/`true`/`[]`，前端必须把它们当作可缺失字段处理。`daily_stream_plan` 只暴露 `profile_id`/`version`/`direction`，完整节拍图与每个 beat 的 `objective` 不对外。`current_mainline_beat.version` 独立于 Plan 版本单调递增，是唯一的去重依据；断线恢复以本快照为准，不补播历史 beat。`mainline_config_valid=false` 时 `mainline_errors` 给出降级原因（例如 `mainline_snapshot_unreadable: ...`），此时主线不再推进，但排期、主题与活动事实照常可用，前端只需隐藏主线相关展示。
+
+`daily_theme_*` 与 `session_theme` 的关系取决于服务端灰度开关 `STREAM__MAINLINE_THEME_PROJECTION_ENABLED`：默认关闭时 `daily_theme_*` 跟随实时配置，直播中改配置会让它与 `session_theme` 短暂不一致；开启后直播期间 `daily_theme_*` 由本场冻结快照投影，两者始终一致。**前端应始终以 `session_theme` 作为"本场是什么主题"的判据**，`daily_theme_*` 仅作兼容展示。
+
+### 4.16 最近进出活动
 
 `GET /stream/activities?limit=20`
 
@@ -510,7 +611,7 @@ type StreamActivitiesResponse = {
 
 `extra` 当前可能包含客户端 IP，公开前端不得展示、持久化或上报该字段。
 
-### 4.15 可用情绪动作
+### 4.17 可用情绪动作
 
 `GET /emotion/list`
 
@@ -520,17 +621,21 @@ type EmotionListResponse = {
 };
 ```
 
-当前共 39 个值，按表现语义分组如下：
+当前共 34 个值，按表现语义分组如下：
 
-- 正向：`开心`、`喜欢`、`得意`、`卖萌`、`兴奋`、`温柔`、`亢奋`、`大笑`
-- 亲密/表现：`害羞`、`撒娇`、`自恋`、`做作`、`帅气`、`打招呼`、`笑着挥手`
-- 负向：`生气`、`委屈`、`无语`、`尴尬`、`伤心`、`焦虑`、`困倦`、`疲惫`、`厌恶`、`害怕`
-- 强烈/阴暗：`阴暗`、`暴怒`、`毒舌`、`嘲讽`、`崩溃`、`冷笑`、`震惊`
+- 正向：`开心`、`喜欢`、`得意`、`卖萌`、`兴奋`、`温柔`
+- 亲密/表现：`害羞`、`撒娇`、`自恋`、`做作`、`帅气`、`打招呼`
+- 负向：`生气`、`委屈`、`无语`、`尴尬`、`伤心`、`焦虑`、`疲惫`、`厌恶`、`害怕`
+- 强烈/阴暗：`阴暗`、`暴怒`、`嘲讽`、`崩溃`、`冷笑`、`震惊`
 - 中性/动作：`眼神飘忽`、`祷告`、`认真`、`思考`、`惊讶`、`搞怪`、`宅系`
+
+目录粒度以「观众能否看出差别」为准：每个标定都要对应一段独立动画。`亢奋`、`大笑`、
+`笑着挥手`、`困倦`、`毒舌` 曾在列表内，但它们的画面与 `兴奋`、`开心`、`疲惫`、`嘲讽`
+逐字节相同，已于 34 值版本移除；补上专属素材后可以再加回来。
 
 前端应以接口返回值为准，并为未知值提供通用动作或静态立绘兜底。
 
-### 4.16 提交与查询 SC
+### 4.18 提交与查询 SC
 
 `POST /sc`，认证：登录 Cookie 或 Bearer Token。游客不能提交。
 
@@ -596,7 +701,26 @@ type SCStatusResponse = {
 
 当前 SC v1 不代表真实支付，也不接受 `amount`、订单号或客户端优先级。未来支付版必须由服务端验证支付平台签名、订单状态、金额、账号归属和重复 webhook 后才能入队；前端不得提前发送或信任这些字段。
 
-### 4.17 观众表情配置
+### 4.19 本站主播管理状态
+
+`GET /moderation/status`，认证：登录账号。返回当前账号在本服务内的禁言状态，供
+页面刷新或 WebSocket 重连后恢复；游客没有跨连接的 HTTP 查询能力。
+
+```ts
+type ModerationStatusResponse = {
+  muted: boolean;
+  mute_until: ISODateTime | null;
+  pending: boolean;
+  admin_review_required: boolean;
+  retry_after_seconds: number;
+};
+```
+
+响应不会包含 toxicity、confidence、reason_code、账号内部标识、IP 或违规原文。
+未登录返回 `401`；读取过于频繁返回统一 `429`，前端按响应中的
+`Retry-After` 倒计时，不要清除登录态。
+
+### 4.20 观众表情配置
 
 `GET /emotes/config`，无需登录。后端只维护稳定 ID，不返回图片 URL 或文件路径。
 
@@ -608,6 +732,59 @@ type EmoteConfigResponse = {
 ```
 
 前端 JavaScript 按 `emote_id` 映射本地静态资源。未知 ID 使用通用占位或忽略，禁止将 ID 直接拼接成未经校验的 HTML/URL。
+
+### 4.21 赞助入口配置
+
+`GET /sponsor/config`，无需登录。页面最底部赞助入口的展示元数据，文案由后端驱动，
+改文案不需要重新发布前端。
+
+```ts
+type SponsorConfigResponse = {
+  enabled: boolean;        // 总开关；false 时前端不渲染入口
+  list_enabled: boolean;   // 感谢墙是否可见（总开关与名单同步都开启才为 true）
+  platform_name: string;   // 展示用渠道名，如「爱发电」
+  platform_url: string;    // 外链地址，可能为空字符串
+  notice_text: string;     // 成本说明文案
+};
+```
+
+**赞助不授予任何功能权益。** 不给权限、不给 SC 额度、不给徽章、不改排队优先级，
+也不进入人格与记忆链路；它只影响页面上的展示。前端文案必须写明这一点，避免观众
+误以为弹幕、SC 或 AI 回复需要付费。
+
+响应永不包含收款平台凭据（`afdian_user_id` / `afdian_token`），这两项仅存在于服务端
+配置中，也不会出现在 admin `GET /config` 里。`platform_url` 为空时不要渲染跳转按钮；
+渲染时必须用 `target="_blank"` + `rel="noopener noreferrer"`。
+
+### 4.22 赞助者名单
+
+`GET /sponsors`，无需登录。感谢墙数据，**仅昵称**。
+
+```ts
+type SponsorListResponse = {
+  enabled: boolean;              // 与 4.21 的 list_enabled 一致
+  total_count: number;           // 去除隐藏项后的总人数
+  updated_at: ISODateTime | null;// 最后一次同步成功时间
+  sponsors: { display_name: string }[];
+};
+```
+
+脱敏承诺：响应里**没有金额、没有档位、没有排名、没有平台用户 ID、没有订单号**。
+`sponsors` 的顺序与金额无关（服务端按平台用户 ID 的哈希打散，同一批数据顺序稳定），
+前端不要再按任何字段排序，也不要把出现位置解释成贡献大小。
+
+`enabled=false`（总开关关闭或名单同步未开启）时固定返回
+`{"enabled": false, "total_count": 0, "updated_at": null, "sponsors": []}`，
+前端按空名单渲染占位文案即可，不要重试。`total_count` 可能大于 `sponsors.length`
+（后端有返回上限），此时展示「已显示前 N 位」之类的说明，不要自行分页——没有分页接口。
+
+`display_name` 已在服务端清理控制字符并截断，但仍属于用户输入：只能作为文本节点渲染，
+禁止拼接进 HTML。想匿名的赞助者会显示统一占位名（默认「匿名赞助者」）；已经上墙的人
+联系主播即可撤下，下一次同步生效。
+
+名单同步失败时接口会继续返回上一次成功的数据（只是 `updated_at` 变旧），因此前端不需要
+为「暂时读不到」设计特殊状态，按普通网络错误提示并允许重试即可。此链路是纯旁路，
+任何失败都不影响弹幕、SC、AI 回复与鉴权。
 
 ## 5. WebSocket `/danmaku`
 
@@ -674,6 +851,9 @@ type ServerWebSocketEvent =
   | UserActivityEvent
   | StreamStatusEvent
   | StreamerActivityEvent
+  | StreamerIdleStateEvent
+  | StreamerBeatEvent
+  | StreamMainlineBeatEvent
   | ViewerEmoteEvent
   | RateLimitedEvent
   | WebSocketErrorEvent;
@@ -703,9 +883,18 @@ type HistoryBatchEvent = {
 
 此事件与多数事件不同，没有 `data` 包装层。
 
+`messages` 同时包含普通弹幕和已接受的 SC。前端按 `Danmaku.type` 区分：
+
+- `normal`：普通弹幕。
+- `sc`：SC 公共展示消息，`danmakuID` 等于 `sc_id`。
+
+SC 在服务端首次接受时就进入该历史，不等待主播回复；HTTP 幂等重放不会产生重复项。该历史为当前服务进程内的有界直播历史，服务重启后不会作为跨场回放恢复。
+
 ### 5.4 `danmaku_realtime`
 
 每条合法弹幕会广播给所有连接，包括发送者。
+
+首次成功接受的 SC 也使用此事件实时广播，其中 `data.type="sc"`。这只代表直播间展示，不表示 SC 已被主播回复；回复进度仍以 `sc_status` 为准。
 
 ```ts
 type DanmakuRealtimeEvent = {
@@ -800,8 +989,25 @@ type SCAIReplyEvent = {
   };
 };
 
-type AIReplyEvent = NormalAIReplyEvent | SCAIReplyEvent;
+type AIReplyEvent = NormalAIReplyEvent | SCAIReplyEvent | DirectorAIReplyEvent;
 ```
+
+主线 Director 的主动台词（P26）也走同一个事件，但它不是对某条弹幕的回复，因此**没有** `danmaku_id` / `nickname` / `original_message`：
+
+```ts
+type DirectorAIReplyEvent = {
+  type: "ai_reply";
+  data: {
+    source: "stream_director";
+    stream_session_id: string;
+    beat_version: number;
+    reply: AIReply;
+    timestamp: ISODateTime;
+  };
+};
+```
+
+前端必须按 `data.source` 判别再取字段：主动台词是最低优先级演出，建议在已有回复正在播放或排队时直接丢弃，并在收到普通/SC 回复时清掉队列里尚未播放的主动台词。该事件仅在 `STREAM__DIRECTOR_ENABLED=true` 且 `STREAM__DIRECTOR_PERFORMANCE_ENABLED=true` 时可能出现。
 
 渲染规则：`reply.emotions[i]` 与 `reply.sentences[i].emotion` 设计上应一一对应；前端应以 `sentences` 为主要文本来源，并对空数组做容错。
 
@@ -921,9 +1127,17 @@ type StreamStatusEvent = {
     daily_theme_date: string;
     theme_config_valid: boolean;
     theme_errors: string[];
+    special_date_theme: SpecialDateTheme | null;
+    stream_session_id: string | null;
+    session_theme: SessionTheme | null;
+    daily_stream_plan: DailyStreamPlan | null;
+    current_mainline_beat: MainlineBeat | null;
+    mainline_config_valid: boolean;
+    mainline_errors: string[];
     current_activity: StreamerActivity | null;
     activity_config_valid: boolean;
     activity_errors: string[];
+    streamer_idle_state: StreamerIdleState | null;
   };
   timestamp: ISODateTime;
 };
@@ -951,6 +1165,68 @@ type StreamerActivityEvent = {
 ```
 
 以 `(stream_session_id, version)` 去重。先把 `current` 写入活动展示，再播放 `sentences`；事件不包含促成切换的账号、昵称、关系分或原始弹幕。断线期间漏掉事件时，以 `stream_metadata.current_activity` 快照恢复事实，不补播旧演出。
+
+### 5.12.2 `streamer_idle_state`
+
+主播待机外显状态的独立增量事件，不属于弹幕回复或活动切换，也不占用 AI 队列。
+
+```ts
+type StreamerIdleStateEvent = {
+  type: "streamer_idle_state";
+  data: StreamerIdleState;
+  timestamp: ISODateTime;
+};
+```
+
+前端按 `version` 去重，仅使用 `idle_state`/`frontend_animation` 映射演出资源；未知状态或动画使用静态默认展示。断线恢复以 `stream_metadata.streamer_idle_state` 快照为准。`idle_text` 是演出文案，不应伪装成主播主动说出的弹幕回复。
+
+### 5.12.3 `streamer_beat`
+
+低频、可丢弃的主播微动作演出。它不属于 `ai_reply`、普通弹幕或 SC：后端只会在开播、低弹幕热度、没有 SC 排队和 AI 工作等待时发送；断线、拥塞或繁忙期间漏掉的事件不会补播。
+
+```ts
+type StreamerBeatEvent = {
+  type: "streamer_beat";
+  data: {
+    stream_session_id: string;
+    version: number;
+    activity_version: number;
+    beat_type:
+      | "activity_progress"
+      | "glance_chat"
+      | "short_pause"
+      | "compose_mood"
+      | "invite_participation"
+      | "natural_close";
+    display_text: string;
+    occurred_at: ISODateTime;
+  };
+  timestamp: ISODateTime;
+};
+```
+
+以 `(stream_session_id, version)` 去重。`display_text` 是短演出提示，可展示为独立状态条或轻量气泡；不要写入弹幕历史、不要伪装成主播回复、不要由此更新 SC 或回复完成状态。未知 `beat_type` 保留文本或安全忽略即可。活动切换优先级更高，当前活动快照仍以 `stream_metadata.current_activity` 为准。
+
+### 5.12.4 `stream_mainline_beat`
+
+本场主线节拍推进时的增量事件（P26）。它只声明"直播走到了哪一段"，不含台词、不含动画、不占 AI 队列，也不是弹幕回复。仅在 `STREAM__MAINLINE_ENABLED=true` 且 Director 实际改写事实时发送（`STREAM__DIRECTOR_MODE=shadow` 只做影子比对，不会发）。
+
+```ts
+type StreamMainlineBeatEvent = {
+  type: "stream_mainline_beat";
+  data: {
+    stream_session_id: string;
+    plan_version: number;
+    beat: MainlineBeat;
+    activity_version: number;
+    trigger_source: "stream_director" | string;
+    reason_code: string; // 例如 OPENING_COMPLETE / ROOM_QUIET / SCHEDULE_WRAP_UP
+  };
+  timestamp: ISODateTime;
+};
+```
+
+以 `(stream_session_id, beat.version)` 去重，并且必须**丢弃版本号不大于当前值的事件**——节拍只会前进，乱序或重放的旧版本不得回退展示。断线期间漏掉的推进不补播，重连后以 `stream_metadata.current_mainline_beat` 快照恢复。`beat.label` 可直接展示（例如状态条"正在推进：打通第三关"），`kind` 可用于选择展示样式，未知 `kind` 按 `mainline` 兜底。同一场次内 `plan_version` 恒定；若它发生变化说明是新的一场，应整体重置主线展示。
 
 ### 5.13 `error`
 
@@ -988,7 +1264,35 @@ type RateLimitedEvent = {
 - `drop`：当前操作未进入后续 AI 处理；不要自动重发，避免重复弹幕风暴。
 - `disconnect`：展示信息后等待服务端关闭；按关闭码决定是否重连。
 
-### 5.15 推荐连接时序
+### 5.15 `streamer_moderation`
+
+主播管理分析在原始弹幕广播后异步执行。事件只发送给触发该弹幕的连接，
+不包含 toxicity、confidence、reason_code、账号 ID、IP 或违规原文。
+
+```ts
+type StreamerModerationEvent = {
+  type: "streamer_moderation";
+  data: {
+    action: "warning" | "timeout" | "admin_review" | "muted" | "pending";
+    scope: "self";
+    muted: boolean;
+    mute_until: ISODateTime | null;
+    retry_after_seconds: number;
+    message: string;
+    moderation_id: string | null;
+    timestamp: ISODateTime;
+  };
+};
+```
+
+主播针对越界内容的公开回应仍使用 `ai_reply`，但其 `data.source` 为
+`"moderation"`，携带 `moderation_id` 和 `reply`，不携带被处理弹幕的
+`original_message`。模型失败时后端使用固定设界模板，禁言状态不会因此撤销。
+
+登录用户可通过 `GET /moderation/status` 恢复自己的本站禁言状态；游客只在当前
+WebSocket 连接范围内保留行为状态。
+
+### 5.16 推荐连接时序
 
 ```ts
 const ws = new WebSocket(`${WS_BASE}/danmaku`);
@@ -1009,7 +1313,8 @@ ws.onmessage = (event) => {
       // 按 danmakuID 去重后插入
       break;
     case "ai_reply":
-      // 关联 data.danmaku_id 并播放 sentences
+      // 先看 data.source：普通/SC 按 data.danmaku_id 关联；
+      // "stream_director" 是无来源弹幕的主动台词，按最低优先级播放或丢弃
       break;
     case "viewer_emote":
       // 按 emote_id 渲染前端本地静态资源
@@ -1024,13 +1329,16 @@ ws.onmessage = (event) => {
     case "viewer_count_update":
       // 更新直播元信息
       break;
+    case "stream_mainline_beat":
+      // 仅在 data.beat.version 大于当前值时更新主线展示
+      break;
   }
 };
 ```
 
 建议前端实现带抖动的指数退避重连：
 
-- `1008`：令牌无效，停止自动重连并要求重新登录。
+- 失效令牌不会触发专用 WebSocket 关闭码，而是以游客身份继续连接；登录态恢复由 HTTP `401`/refresh 流程负责。
 - `1009`：发送帧过大，修正负载后由用户重新连接，不要原样重发。
 - `1013`：握手频率、连接数或服务容量受限，至少等待上次已知 `retry_after_seconds`，未知时从 2 秒开始退避。
 - `1001`：服务端优雅关闭。默认配置不会再因 120 秒没有客户端入站消息而关闭连接；只有运维显式启用应用层空闲超时/最大生命周期时才可能用于连接回收。
@@ -1038,22 +1346,7 @@ ws.onmessage = (event) => {
 
 ## 6. 可选展示 HTTP 接口
 
-### 6.1 热门话题
-
-`GET /memory/hot-topics?limit=5`
-
-```ts
-type HotTopicsResponse = {
-  hot_topics: Array<{
-    topic: string;
-    heat: number;
-  }>;
-};
-```
-
-这是当前进程内的直播间短期话题，不是账号长期人物记忆。
-
-### 6.2 直播间短期上下文
+### 6.1 直播间短期上下文
 
 `GET /memory/context?limit=10`
 
@@ -1066,14 +1359,13 @@ type RoomMemoryContext = {
     sentiment: number;
     topics: string[];
   }>;
-  hot_topics: Array<{ topic: string; heat: number }>;
   active_users: number;
   total_users: number;
   total_danmaku: number;
 };
 ```
 
-### 6.3 直播间话题讨论情况
+### 6.2 直播间话题讨论情况
 
 `GET /memory/group-discussion?topic=<string>`
 
@@ -1083,12 +1375,10 @@ type GroupDiscussionResponse = {
   exists: boolean;
   danmaku_count: number;
   user_count: number;
-  heat: number;
-  is_hot: boolean;
 };
 ```
 
-### 6.4 直播间对人格的聚合影响
+### 6.3 直播间对人格的聚合影响
 
 `GET /memory/persona-impact`
 
@@ -1482,11 +1772,8 @@ type RoomMemoryStats = {
   total_users: number;
   total_danmaku: number;
   total_topics: number;
-  hot_topics_count: number;
 };
 ```
-
-当前实现遗漏了 `await`，运行时可能返回 500；前端暂时不要接入，修复后再启用。
 
 ### 7.7 情绪管理调试
 
@@ -1533,6 +1820,63 @@ type EmotionInfo = {
 
 返回 `{ success: boolean, message: string }`，会重置服务内近期情绪动作历史。
 
+### 7.8 赞助名单同步状态
+
+`GET /admin/sponsor/stats`，认证：管理接口密钥。用于确认轮询是否健康。
+
+```ts
+type SponsorSyncStatsResponse = {
+  enabled: boolean;
+  sync_enabled: boolean;
+  credentials_configured: boolean;  // 只报是否配置，不回显凭据本身
+  sponsor_count: number;
+  hidden_count: number;
+  anonymous_count: number;
+  synced_count: number;
+  consecutive_failures: number;
+  last_success_at: ISODateTime | null;
+  last_attempt_at: ISODateTime | null;
+  last_error_code: string | null;   // 受控错误码，如 network_error / api_error
+};
+```
+
+不返回凭据、不返回单人金额、不返回平台用户 ID。`ADMIN__ENABLED=false` 时该路径返回
+`404`（管理接口整体隐藏），密钥缺失或错误返回 `403`。
+
+### 7.9 主播工作记忆（Prompt RAM）
+
+`GET /admin/prompt-ram`，认证：管理接口密钥。
+
+```ts
+type PromptRamResponse = {
+  enabled: boolean;
+  stats: {
+    harvested: number; rejected: number; fulfilled: number;
+    superseded: number; expired: number; evicted: number; errors: number;
+    open_entries: number; total_entries: number;
+    last_harvest_at: ISODateTime | null;
+  };
+  entries: Array<{
+    entry_id: string;
+    kind: "awaiting_viewer" | "owed_followup" | "standing_idea" | "holding_back";
+    state: "open" | "fulfilled" | "superseded";
+    note: string;                     // 模型生成的念头原文，已消毒
+    target_nickname: string;          // 仅供展示，永不用于身份匹配
+    target_subject_id: string | null; // 身份主键，只在本接口出现
+    created_at: ISODateTime;
+    remaining_seconds: number;
+    version: number;
+  }>;
+};
+```
+
+**前端（观众页）不消费这个接口。** `note` 是主播的内部念头、
+`target_subject_id` 是身份主键，两者只允许出现在这个管理接口里：
+不进 WS 广播、不进数据库、不进任何面向观众的响应。`ai_reply` 事件里
+永远不会出现 `thoughts` 字段。
+
+`PROMPT_RAM__ENABLED=false`（默认）时返回 `enabled: false` 且 `entries` 为空。
+
 ## 8. 前端实现建议
 
 ### 8.1 推荐模块边界
@@ -1555,7 +1899,10 @@ stores/chat.ts          Danmaku 与 AIReply，按 danmakuID 关联
 - `history_batch` 没有 `data` 包装层。
 - `confirmation` 没有 `danmakuID`。
 - `AIReply.sentences` 可能为空或 1–4 条，按数组渲染。
-- `401` 和 WebSocket `1008` 进入重新登录流程。
+- `ai_reply` 先判 `data.source`：`stream_director` 变体没有 `danmaku_id`/`nickname`/`original_message`。
+- 主线字段（`session_theme`、`daily_stream_plan`、`current_mainline_beat`）可能整段为 `null`，按功能未开启处理。
+- `stream_mainline_beat` 与 `streamer_beat`/`streamer_activity` 各有独立的 `version`，不可互相比较。
+- 仅 HTTP `401`（refresh 失败且 profile 重试仍失败）进入重新登录流程；WebSocket 失效令牌会降级为游客。
 - 所有 `extra` 和动态调试字段都按未知扩展字段处理。
 - 不将 `client_ip`、Token、API Key、数据库导出内容送往日志和埋点。
 

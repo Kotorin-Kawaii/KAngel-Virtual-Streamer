@@ -11,7 +11,7 @@ try:
     from fastembed import TextEmbedding
     USE_FASTEMBED = True
 except ImportError as e:
-    logger.warning(f"⚠️ 无法导入fastembed，将使用TF-IDF方案: {e}")
+    logger.warning(f"无法导入fastembed，将使用TF-IDF方案: {e}")
     USE_FASTEMBED = False
 
 if not USE_FASTEMBED:
@@ -46,12 +46,12 @@ class KnowledgeBase:
         os.makedirs(db_path, exist_ok=True)
         
         # 初始化嵌入模型
-        logger.info(f"📚 初始化语义嵌入模型...")
+        logger.info("初始化语义嵌入模型...")
         use_fastembed_local = USE_FASTEMBED
         
         if use_fastembed_local:
             try:
-                logger.info(f"🔄 正在加载/下载模型: BAAI/bge-small-en-v1.5")
+                logger.info("正在加载/下载模型: BAAI/bge-small-en-v1.5")
                 self.embedding_model = TextEmbedding(
                     model_name="BAAI/bge-small-en-v1.5",
                     cache_dir=None,
@@ -60,12 +60,12 @@ class KnowledgeBase:
                 # 强制触发模型加载和下载
                 _ = self.embedding_model.embed(["test"])
                 self.vector_dim = 384
-                logger.info(f"✅ 使用fastembed模型: BAAI/bge-small-en-v1.5")
+                logger.info("使用fastembed模型: BAAI/bge-small-en-v1.5")
             except Exception as e:
-                logger.error(f"❌ 加载fastembed失败，回退到TF-IDF")
+                logger.error("加载fastembed失败，回退到TF-IDF")
                 logger.error(f"   错误详情: {str(e)[:200]}")
-                logger.warning(f"⚠️ 提示：如果是首次使用，可能需要手动下载模型")
-                logger.warning(f"⚠️ 可以尝试命令：python -c \"from fastembed import TextEmbedding; model = TextEmbedding('BAAI/bge-small-en-v1.5'); print('下载完成')\"")
+                logger.warning("提示：如果是首次使用，可能需要手动下载模型")
+                logger.warning("可以尝试命令：python -c \"from fastembed import TextEmbedding; model = TextEmbedding('BAAI/bge-small-en-v1.5'); print('下载完成')\"")
                 use_fastembed_local = False
         
         self.use_fastembed = use_fastembed_local
@@ -77,20 +77,20 @@ class KnowledgeBase:
                 token_pattern=r'(?u)\b\w+\b'
             )
             self._fit_tfidf()
-            logger.info(f"✅ 使用TF-IDF嵌入方案")
+            logger.info("使用TF-IDF嵌入方案")
         
         # 连接LanceDB
-        logger.info(f"📊 连接LanceDB: {db_path}")
+        logger.info(f"连接LanceDB: {db_path}")
         self.db = lancedb.connect(db_path)
         
         # 创建或获取表
         self.table_name = "qa_documents"
         if self.table_name not in self.db.table_names():
-            logger.info(f"🗂️ 创建新表: {self.table_name}")
+            logger.info(f"创建新表: {self.table_name}")
             self.db.create_table(self.table_name, schema=QADocument)
         
         self.table = self.db.open_table(self.table_name)
-        logger.info(f"✅ 知识库初始化完成")
+        logger.info("知识库初始化完成")
     
     def _fit_tfidf(self):
         """预训练TF-IDF模型（使用示例文本）"""
@@ -139,7 +139,7 @@ class KnowledgeBase:
         )
         
         self.table.add([doc])
-        logger.debug(f"📥 添加QA文档: {q_id}")
+        logger.debug(f"添加QA文档: {q_id}")
     
     def add_qa_pairs(self, qa_list: List[Tuple[str, str, str]]) -> None:
         """
@@ -165,7 +165,7 @@ class KnowledgeBase:
         
         if documents:
             self.table.add(documents)
-            logger.info(f"📥 批量添加 {len(documents)} 条QA文档")
+            logger.info(f"批量添加 {len(documents)} 条QA文档")
     
     def query(self, query_text: str, top_k: int = 3) -> List[Dict[str, str]]:
         """
@@ -251,7 +251,7 @@ class KnowledgeBase:
                 })
                 seen_q_ids.add(item["q_id"])
         
-        logger.debug(f"🔍 检索结果: {len(keyword_results)}个关键词匹配, {len(final_results) - len(keyword_results)}个语义匹配")
+        logger.debug(f"检索结果: {len(keyword_results)}个关键词匹配, {len(final_results) - len(keyword_results)}个语义匹配")
         return final_results[:top_k]
     
     def get_all_documents(self) -> List[Dict[str, str]]:
@@ -274,7 +274,7 @@ class KnowledgeBase:
     def clear_all(self) -> None:
         """清空所有文档"""
         self.table.delete(self.table.search())
-        logger.info("🗑️ 知识库已清空")
+        logger.info("知识库已清空")
 
 
 # 预定义的关键词触发规则
@@ -380,7 +380,7 @@ def load_qa_pairs_from_text(qa_text: str) -> List[Tuple[str, str, str]]:
     matches = list(pattern.finditer(qa_text))
     
     if not matches:
-        logger.warning("⚠️ 未找到QA数据格式")
+        logger.warning("未找到QA数据格式")
         return qa_list
     
     # 遍历每个匹配，提取QA对
@@ -410,5 +410,5 @@ def load_qa_pairs_from_text(qa_text: str) -> List[Tuple[str, str, str]]:
             qa_list.append((q_id, question, answer))
             logger.debug(f"解析QA: {q_id} - {question[:20]}...")
     
-    logger.info(f"📝 成功解析 {len(qa_list)} 条QA数据")
+    logger.info(f"成功解析 {len(qa_list)} 条QA数据")
     return qa_list

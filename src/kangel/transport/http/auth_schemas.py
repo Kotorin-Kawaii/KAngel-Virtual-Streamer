@@ -39,6 +39,12 @@ class AuthTokenResponse(BaseModel):
     expires_at: str
 
 
+class AuthRefreshResponse(BaseModel):
+    """浏览器刷新成功响应；令牌仅通过 HttpOnly Cookie 轮换。"""
+    account: AccountResponse
+    expires_at: str
+
+
 class RateLimitErrorResponse(BaseModel):
     code: str = "rate_limited"
     message: str

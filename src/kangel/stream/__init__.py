@@ -1,9 +1,26 @@
 """Stream 稳定公共 API。"""
 
-from .domain import ScheduleSnapshot, StreamScheduleService
+from .domain import (
+    DailyStreamPlanBeat,
+    DailyStreamPlanSnapshot,
+    ScheduleSnapshot,
+    StreamMainlineState,
+    StreamScheduleService,
+)
 
-_APPLICATION = {"DailyThemeService", "DailyThemeSnapshot", "MetadataEventType", "MoodPusher", "StreamMetadata", "StreamMetadataPusher", "StreamerActivityService", "StreamerActivityState", "UserActivity"}
-__all__ = ["ScheduleSnapshot", "StreamScheduleService", *_APPLICATION]
+_APPLICATION = {
+    "DailyStreamPlanService", "DailyThemeService", "DailyThemeSnapshot",
+    "DeterministicStreamDirector", "DirectorSignalTracker", "MetadataEventType",
+    "MoodPusher", "SessionSummaryValidator", "StreamDirectorRuntime",
+    "StreamMainlineService", "StreamMetadata", "StreamMetadataPusher",
+    "StreamerActionDecision", "StreamerActionExecutor", "StreamSessionSummaryConsumer",
+    "StreamSessionSummaryService", "StreamerActivityService", "StreamerActivityState",
+    "UserActivity",
+}
+__all__ = [
+    "DailyStreamPlanBeat", "DailyStreamPlanSnapshot", "ScheduleSnapshot",
+    "StreamMainlineState", "StreamScheduleService", *_APPLICATION,
+]
 
 def __getattr__(name: str):
     if name in _APPLICATION:

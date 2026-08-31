@@ -40,6 +40,7 @@ class AccountMemoryGovernanceService:
             account_id, limit=20
         )
         summaries = self.database.list_account_topic_memories(account_id, limit=20)
+        episodic = self.database.list_account_episodic_memories(account_id, limit=100)
         return {
             "account_id": account_id,
             "long_term_memory_enabled": preference["long_term_memory_enabled"],
@@ -47,6 +48,7 @@ class AccountMemoryGovernanceService:
             "relationship": relationship,
             "recent_conversations": [self._public_fragment(item) for item in fragments],
             "topic_summaries": [self._public_topic(item) for item in summaries],
+            "episodic_memories": [self._public_episodic(item) for item in episodic],
         }
 
     def export(self, account_id: str) -> dict:
@@ -67,6 +69,10 @@ class AccountMemoryGovernanceService:
         snapshot["topic_summaries"] = [
             self._public_topic(item)
             for item in self.database.list_account_topic_memories(account_id, limit=1000)
+        ]
+        snapshot["episodic_memories"] = [
+            self._public_episodic(item)
+            for item in self.database.list_account_episodic_memories(account_id, limit=1000)
         ]
         for item in snapshot["nickname_history"]:
             item["is_current"] = bool(item["is_current"])
@@ -104,6 +110,16 @@ class AccountMemoryGovernanceService:
                 "id", "topic_label", "summary", "source_count", "importance",
                 "first_seen_at", "last_seen_at", "last_accessed_at",
                 "access_count", "expires_at",
+            )
+        }
+
+    def _public_episodic(self, item: dict) -> dict:
+        """只导出用户可理解的记忆，不暴露候选、账号 ID 或安全评分。"""
+        return {
+            key: item.get(key) for key in (
+                "memory_id", "stream_session_id", "event_type", "topic", "summary",
+                "why_notable", "emotional_mark", "follow_up_hint", "salience",
+                "occurred_at", "created_at", "expires_at",
             )
         }
 

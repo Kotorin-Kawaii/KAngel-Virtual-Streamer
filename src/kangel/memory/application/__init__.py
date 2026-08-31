@@ -5,6 +5,10 @@ _MODULES = {
     "ConversationContinuityAnalyzer": "long_term_memory",
     "ConversationTransition": "long_term_memory",
     "LongTermMemoryManager": "long_term_memory",
+    "EpisodicMemoryManager": "episodic",
+    "EpisodicMemoryConsumer": "episodic",
+    "episodic_memory_manager": "episodic",
+    "episodic_memory_consumer": "episodic",
 }
 __all__ = list(_MODULES)
 

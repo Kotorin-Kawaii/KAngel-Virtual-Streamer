@@ -3,7 +3,7 @@
 __all__ = [
     "AuthService", "BoundedWorkGate", "ConcurrencyGate", "DatabaseManager",
     "EventBus", "HttpProtectionMiddleware", "InMemoryRateLimiter",
-    "OverloadProtector", "SecurityMetrics", "WebSocketRateGuard",
+    "OverloadProtector", "PromptBudgetMetrics", "ReplyTimingMetrics", "SecurityMetrics", "WebSocketRateGuard",
 ]
 
 
@@ -17,6 +17,8 @@ def __getattr__(name):
         "HttpProtectionMiddleware": (".http_protection", "HttpProtectionMiddleware"),
         "InMemoryRateLimiter": (".rate_limiter", "InMemoryRateLimiter"),
         "OverloadProtector": (".overload_protection", "OverloadProtector"),
+        "PromptBudgetMetrics": (".prompt_budget", "PromptBudgetMetrics"),
+        "ReplyTimingMetrics": (".reply_timing", "ReplyTimingMetrics"),
         "SecurityMetrics": (".security_metrics", "SecurityMetrics"),
         "WebSocketRateGuard": (".realtime_protection", "WebSocketRateGuard"),
     }

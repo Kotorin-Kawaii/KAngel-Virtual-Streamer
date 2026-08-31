@@ -70,7 +70,12 @@ class HttpProtectionMiddleware:
             peer[0], headers.get("x-forwarded-for", ""), config.trusted_proxy_cidrs
         )
         path = scope.get("path", "")
-        cheap_read = path in {"/", "/status", "/stream/metadata", "/emotion/list"}
+        # 赞助入口是页面底部的纯展示读取（配置直读 + 名单带进程内缓存），
+        # 与其他 cheap_read 同级：不占用过载配额，也不该因繁忙而 503。
+        cheap_read = path in {
+            "/", "/status", "/stream/metadata", "/emotion/list",
+            "/sponsor/config", "/sponsors",
+        }
         if not cheap_read:
             # 延迟导入避免应用启动时的模块环；控制面保持可用。
             from .bounded_work_gate import ai_reply_work_gate

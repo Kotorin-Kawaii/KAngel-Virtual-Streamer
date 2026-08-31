@@ -101,7 +101,10 @@ class SCService:
     @staticmethod
     def validate_content(content: str) -> None:
         normalized = content.casefold()
-        if any(term.strip().casefold() in normalized for term in settings.sc.blocked_terms if term.strip()):
+        blocked_terms = tuple(settings.sc.blocked_terms) + tuple(
+            settings.moderation.hard_violation_terms
+        )
+        if any(term.strip().casefold() in normalized for term in blocked_terms if term.strip()):
             raise SCContentRejectedError("SC 内容未通过安全检查")
         if settings.sc.reject_prompt_injection and any(
             pattern.search(content) for pattern in _PROMPT_INJECTION_PATTERNS
@@ -165,6 +168,13 @@ class SCService:
         with self.database._get_connection() as conn:
             return conn.execute(
                 "SELECT 1 FROM sc_queue WHERE status = 'pending' LIMIT 1"
+            ).fetchone() is not None
+
+    def has_active_work(self) -> bool:
+        """供可丢弃的后台演出让行；pending 与 processing 均视为 SC 繁忙。"""
+        with self.database._get_connection() as conn:
+            return conn.execute(
+                "SELECT 1 FROM sc_queue WHERE status IN ('pending', 'processing') LIMIT 1"
             ).fetchone() is not None
 
     def claim_next(self, lease_seconds: int) -> dict | None:

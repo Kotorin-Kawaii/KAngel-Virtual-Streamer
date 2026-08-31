@@ -23,6 +23,7 @@ class AccountMemoryResponse(BaseModel):
     relationship: Optional[dict[str, Any]] = None
     recent_conversations: list[dict[str, Any]] = Field(default_factory=list)
     topic_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    episodic_memories: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AccountMemoryExportResponse(AccountMemoryResponse):
@@ -84,6 +85,45 @@ class SCConfigResponse(BaseModel):
 class EmoteConfigResponse(BaseModel):
     allowed_ids: list[str]
     cooldown_seconds: int
+
+
+class SponsorConfigResponse(BaseModel):
+    """页面底部赞助入口的展示元数据；不含任何平台凭据。"""
+
+    enabled: bool
+    list_enabled: bool
+    platform_name: str
+    platform_url: str
+    notice_text: str
+
+
+class SponsorEntry(BaseModel):
+    display_name: str
+
+
+class SponsorListResponse(BaseModel):
+    """感谢墙：仅昵称，无排序，无金额，无平台 ID。"""
+
+    enabled: bool
+    total_count: int
+    updated_at: Optional[str] = None
+    sponsors: list[SponsorEntry]
+
+
+class SponsorSyncStatsResponse(BaseModel):
+    """仅管理端可见的同步健康度；不返回凭据与单人金额。"""
+
+    enabled: bool
+    sync_enabled: bool
+    credentials_configured: bool
+    sponsor_count: int
+    hidden_count: int
+    anonymous_count: int
+    synced_count: int
+    consecutive_failures: int
+    last_success_at: Optional[str] = None
+    last_attempt_at: Optional[str] = None
+    last_error_code: Optional[str] = None
 
 
 class DanmakuResponse(BaseModel):

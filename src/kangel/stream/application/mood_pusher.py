@@ -47,7 +47,7 @@ class MoodPusher:
         self._stats["start_time"] = datetime.now().isoformat()
         self._push_task = asyncio.create_task(self._push_loop())
         
-        logger.info(f"🚀 心情推送服务启动，推送间隔: {self._push_interval_ms}ms")
+        logger.info(f"心情推送服务启动，推送间隔: {self._push_interval_ms}ms")
     
     async def stop(self):
         """停止推送服务"""
@@ -63,7 +63,7 @@ class MoodPusher:
             except asyncio.CancelledError:
                 pass
         
-        logger.info("🛑 心情推送服务已停止")
+        logger.info("心情推送服务已停止")
     
     async def subscribe(self, websocket: WebSocket):
         """订阅心情推送"""

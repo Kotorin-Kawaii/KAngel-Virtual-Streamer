@@ -18,7 +18,11 @@ class WebSocketEventType(str, Enum):
     USER_ACTIVITY = "user_activity"
     STREAM_STATUS = "stream_status"
     STREAMER_ACTIVITY = "streamer_activity"
+    STREAMER_BEAT = "streamer_beat"
+    STREAM_MAINLINE_BEAT = "stream_mainline_beat"
+    STREAMER_IDLE_STATE = "streamer_idle_state"
     SC_STATUS = "sc_status"
+    STREAMER_MODERATION = "streamer_moderation"
 
 
 __all__ = ["WebSocketEventType"]

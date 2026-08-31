@@ -151,7 +151,7 @@ class ConnectionManager:
             ip_connections = self._ip_connection_map.get(connection.client_ip, set())
             if len(ip_connections) > 1:
                 logger.warning(
-                    f"⚠️ IP {connection.client_ip} 有 {len(ip_connections)} 个活跃连接: "
+                    f"IP {connection.client_ip} 有 {len(ip_connections)} 个活跃连接: "
                     f"{list(ip_connections)}"
                 )
         
@@ -262,12 +262,13 @@ class ConnectionManager:
             logger.error(f"发送历史弹幕失败 [ID: {connection.id[:8]}]: {e}")
     
     async def broadcast_message(self, message: DanmakuResponse):
-        """广播弹幕消息给所有连接的客户端"""
-        if not self.active_connections:
-            return
-        
+        """记录并广播直播间展示消息；普通弹幕与 SC 共用展示历史。"""
         async with self._lock:
             self.message_history.append(message.model_dump())
+
+        # 房间暂时无人时仍保留历史，供稍后建立的连接初始化。
+        if not self.active_connections:
+            return
         
         broadcast_data = {
             "type": WebSocketEventType.DANMAKU_REALTIME,

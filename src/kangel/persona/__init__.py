@@ -2,6 +2,7 @@
 
 from .domain import (
     AIReply,
+    AffectAfterglow,
     AudienceAtmosphereTickEvent,
     DanmakuReceivedEvent,
     DynamicsContext,
@@ -16,6 +17,8 @@ from .domain import (
     PersonaBehavior,
     PersonaDecision,
     PersonaDynamics,
+    PersonaAffectAnchor,
+    PersonaDynamicsTuning,
     PersonaEvent,
     PersonaEventReducer,
     PersonaEventType,
@@ -29,6 +32,7 @@ from .domain import (
 
 __all__ = [
     "AIReply",
+    "AffectAfterglow",
     "AudienceAtmosphereTickEvent",
     "DanmakuReceivedEvent",
     "DynamicsContext",
@@ -43,6 +47,8 @@ __all__ = [
     "PersonaBehavior",
     "PersonaDecision",
     "PersonaDynamics",
+    "PersonaAffectAnchor",
+    "PersonaDynamicsTuning",
     "PersonaEvent",
     "PersonaEventReducer",
     "PersonaEventType",

@@ -23,6 +23,10 @@ class InvalidCredentialsError(ValueError):
     pass
 
 
+class InvalidRefreshTokenError(ValueError):
+    pass
+
+
 class AuthService:
     def __init__(self, database=None):
         self.database = database or db_manager
@@ -48,7 +52,7 @@ class AuthService:
             stored = self.database.create_account(account)
         except sqlite3.IntegrityError as exc:
             raise UsernameAlreadyExistsError("用户名已存在") from exc
-        return self._issue_token(stored)
+        return self._issue_token_pair(stored)
 
     def login(self, username: str, password: str) -> dict:
         _, username_key = self._normalize_username(username)
@@ -61,7 +65,7 @@ class AuthService:
         actual_hash = self._hash_password(password, salt)
         if not hmac.compare_digest(actual_hash, account["password_hash"]):
             raise InvalidCredentialsError("用户名或密码错误")
-        return self._issue_token(account)
+        return self._issue_token_pair(account)
 
     def authenticate_access_token(
         self, access_token: str
@@ -79,6 +83,43 @@ class AuthService:
             nickname_version=session["nickname_version"],
         )
 
+    def refresh(self, refresh_token: str) -> dict:
+        """轮换 refresh token，并为同一账号签发新的短期访问会话。"""
+        if not refresh_token or len(refresh_token) > 512:
+            raise InvalidRefreshTokenError("刷新令牌无效或已过期")
+        created_at = self._now_datetime()
+        access_token = secrets.token_urlsafe(32)
+        next_refresh_token = secrets.token_urlsafe(48)
+        access_expires_at = created_at + timedelta(
+            hours=settings.auth.access_token_ttl_hours
+        )
+        refresh_expires_at = created_at + timedelta(
+            hours=settings.auth.refresh_token_ttl_hours
+        )
+        account = self.database.rotate_auth_refresh_session(
+            current_token_hash=self._hash_token(refresh_token),
+            new_access_session={
+                "token_hash": self._hash_token(access_token),
+                "created_at": created_at.isoformat(),
+                "expires_at": access_expires_at.isoformat(),
+            },
+            new_refresh_session={
+                "token_hash": self._hash_token(next_refresh_token),
+                "created_at": created_at.isoformat(),
+                "expires_at": refresh_expires_at.isoformat(),
+            },
+            now=created_at.isoformat(),
+        )
+        if not account:
+            raise InvalidRefreshTokenError("刷新令牌无效或已过期")
+        return {
+            "account": self._account_payload(account),
+            "access_token": access_token,
+            "refresh_token": next_refresh_token,
+            "token_type": "bearer",
+            "expires_at": access_expires_at.isoformat(),
+        }
+
     def update_nickname(self, account_id: str, nickname: str) -> dict:
         normalized = self._normalize_nickname(nickname)
         account = self.database.update_account_nickname(
@@ -87,6 +128,11 @@ class AuthService:
         if not account:
             raise InvalidCredentialsError("账号不存在")
         return self._account_payload(account)
+
+    def get_account(self, account_id: str) -> Optional[dict]:
+        """返回已认证账号的当前展示资料，不暴露令牌或会话信息。"""
+        account = self.database.get_account_by_id(account_id)
+        return self._account_payload(account) if account else None
 
     def list_nickname_history(self, account_id: str) -> list[dict]:
         return [
@@ -103,19 +149,30 @@ class AuthService:
     def delete_nickname_history(self, account_id: str, version: int) -> bool:
         return self.database.delete_account_nickname_history_version(account_id, version)
 
-    def _issue_token(self, account: dict) -> dict:
+    def _issue_token_pair(self, account: dict) -> dict:
         access_token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(48)
         created_at = self._now_datetime()
         expires_at = created_at + timedelta(hours=settings.auth.access_token_ttl_hours)
+        refresh_expires_at = created_at + timedelta(
+            hours=settings.auth.refresh_token_ttl_hours
+        )
         self.database.create_auth_session({
             "token_hash": self._hash_token(access_token),
             "account_id": account["account_id"],
             "created_at": created_at.isoformat(),
             "expires_at": expires_at.isoformat(),
         })
+        self.database.create_auth_refresh_session({
+            "token_hash": self._hash_token(refresh_token),
+            "account_id": account["account_id"],
+            "created_at": created_at.isoformat(),
+            "expires_at": refresh_expires_at.isoformat(),
+        })
         return {
             "account": self._account_payload(account),
             "access_token": access_token,
+            "refresh_token": refresh_token,
             "token_type": "bearer",
             "expires_at": expires_at.isoformat(),
         }

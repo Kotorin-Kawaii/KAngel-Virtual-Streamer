@@ -4,7 +4,7 @@
 """
 
 import asyncio
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Set, Any
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -64,10 +64,10 @@ class DanmakuMemoryManager:
         
         # 时间窗口：最近的弹幕
         self.time_window: deque[DanmakuMemoryItem] = deque(maxlen=settings.danmaku.memory_time_window_size)  # 最近N条弹幕
-        
-        # 话题热度映射：话题 -> 热度值
-        self.topic_heat: Dict[str, float] = {}
-        
+
+        # P30：话题热度已下线。热度公式是三个 min() 相乘，实测峰值 0.06，
+        # 而下游阈值要求 0.5/0.65/0.75，从未触发过；场景感改由 prompt RAM 承担。
+
         # 锁
         self._lock = asyncio.Lock()
         
@@ -78,7 +78,7 @@ class DanmakuMemoryManager:
         self.max_topic_keywords = settings.danmaku.memory_max_topic_keywords  # 每个弹幕最多提取的关键词数
         self.max_topic_memories = settings.danmaku.memory_max_topic_memories  # 每个话题最多记忆的弹幕数
         
-        logger.info(f"✅ 弹幕记忆管理器初始化成功 - 时间窗口大小: {settings.danmaku.memory_time_window_size}, 用户弹幕上限: {self.max_user_danmaku}")
+        logger.info(f"弹幕记忆管理器初始化成功 - 时间窗口大小: {settings.danmaku.memory_time_window_size}, 用户弹幕上限: {self.max_user_danmaku}")
     
     async def add_danmaku(
         self,
@@ -201,10 +201,7 @@ class DanmakuMemoryManager:
             
             # 计算话题强度
             topic.intensity = min(1.0, topic.danmaku_count / 10)
-            
-            # 更新话题热度
-            self.topic_heat[topic_id] = self._calculate_topic_heat(topic)
-    
+
     def _extract_topic_keywords(self, content: str) -> List[str]:
         """提取标签、作品名、英文实体和动态中文话题。"""
         return chinese_text_analyzer.extract_topics(
@@ -218,29 +215,7 @@ class DanmakuMemoryManager:
     def _get_topic_id(self, keyword: str) -> str:
         """获取话题ID"""
         return keyword.lower()
-    
-    def _calculate_topic_heat(self, topic: TopicNode) -> float:
-        """计算话题热度"""
-        # 基于弹幕数量和用户数量计算热度
-        base_heat = min(topic.danmaku_count / 20, 1.0)
-        user_factor = min(topic.user_count / 10, 1.0)
-        time_factor = self._calculate_time_factor(topic.timestamp)
-        
-        return base_heat * user_factor * time_factor
-    
-    def _calculate_time_factor(self, timestamp: datetime) -> float:
-        """计算时间衰减因子"""
-        delta = datetime.now() - timestamp
-        minutes = delta.total_seconds() / 60
-        
-        # 5分钟内热度最高，之后逐渐衰减
-        if minutes < 5:
-            return 1.0
-        elif minutes < 30:
-            return max(0.1, 1.0 - (minutes - 5) / 25)
-        else:
-            return 0.1
-    
+
     async def _cleanup_expired_memory(self):
         """清理过期记忆"""
         now = datetime.now()
@@ -260,8 +235,6 @@ class DanmakuMemoryManager:
         
         for topic_id in expired_topics:
             del self.topic_graph[topic_id]
-            if topic_id in self.topic_heat:
-                del self.topic_heat[topic_id]
         
         # 清理用户话题映射中的过期话题
         for user_id, user_memory in self.user_memories.items():
@@ -292,43 +265,25 @@ class DanmakuMemoryManager:
             related_danmaku = user_memory.topic_map.get(topic, [])
             return related_danmaku
     
-    async def get_hot_topics(self, limit: int = 5) -> List[Tuple[str, float]]:
-        """获取热门话题"""
-        async with self._lock:
-            # 按热度排序
-            hot_topics = sorted(
-                self.topic_heat.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )[:limit]
-            return hot_topics
-    
     async def analyze_group_discussion(self, topic: str) -> Dict[str, Any]:
         """分析群体讨论情况"""
         async with self._lock:
             topic_id = self._get_topic_id(topic)
             topic_node = self.topic_graph.get(topic_id)
-            
+
             if not topic_node:
                 return {
                     "topic": topic,
                     "exists": False,
                     "danmaku_count": 0,
                     "user_count": 0,
-                    "heat": 0.0,
-                    "is_hot": False
                 }
-            
-            heat = self.topic_heat.get(topic_id, 0.0)
-            is_hot = heat > 0.7
-            
+
             result = {
                 "topic": topic,
                 "exists": True,
                 "danmaku_count": topic_node.danmaku_count,
                 "user_count": topic_node.user_count,
-                "heat": heat,
-                "is_hot": is_hot
             }
             return result
     
@@ -350,23 +305,16 @@ class DanmakuMemoryManager:
             # 计算情感倾向
             total_sentiment = sum(item.sentiment for item in recent_danmaku)
             avg_sentiment = total_sentiment / len(recent_danmaku)
-            
-            # 直接获取热门话题，不再次获取锁
-            hot_topics = sorted(
-                self.topic_heat.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )[:3]
-            total_heat = sum(heat for _, heat in hot_topics)
-            avg_heat = total_heat / len(hot_topics) if hot_topics else 0.0
-            
+
             # 计算用户活跃度
-            active_users = len([u for u in self.user_memories.values() 
+            active_users = len([u for u in self.user_memories.values()
                              if (datetime.now() - u.last_active).total_seconds() < 300])
-            
+
             # 计算影响
             impact["mood"] = min(1.0, max(-1.0, avg_sentiment * 0.8 + (active_users / 10) * 0.2))
-            impact["stress"] = min(1.0, max(0.0, avg_heat * 0.6 + (len(recent_danmaku) / 20) * 0.4))
+            # P30：原公式里 avg_heat * 0.6 的那一项随话题热度一起下线，
+            # 权重并入弹幕密度——热度实测封顶 0.06，这一项本来就只贡献 0.036。
+            impact["stress"] = min(1.0, max(0.0, len(recent_danmaku) / 20))
             
             # 阴暗度影响：基于负面内容和高压力
             negative_count = sum(1 for item in recent_danmaku if item.sentiment < -0.3)
@@ -378,16 +326,8 @@ class DanmakuMemoryManager:
         """获取记忆上下文"""
         async with self._lock:
             recent_danmaku = list(self.time_window)[:limit]
-            
-            # 直接获取热门话题，不再次获取锁
-            # 按热度排序
-            hot_topics = sorted(
-                self.topic_heat.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )[:5]
-            
-            active_users = len([u for u in self.user_memories.values() 
+
+            active_users = len([u for u in self.user_memories.values()
                              if (datetime.now() - u.last_active).total_seconds() < 300])
             
             return {
@@ -401,15 +341,11 @@ class DanmakuMemoryManager:
                     }
                     for item in recent_danmaku
                 ],
-                "hot_topics": [
-                    {"topic": topic, "heat": heat}
-                    for topic, heat in hot_topics
-                ],
                 "active_users": active_users,
                 "total_users": len(self.user_memories),
                 "total_danmaku": len(self.time_window)
             }
-    
+
     async def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
         async with self._lock:
@@ -417,7 +353,6 @@ class DanmakuMemoryManager:
                 "total_users": len(self.user_memories),
                 "total_danmaku": len(self.time_window),
                 "total_topics": len(self.topic_graph),
-                "hot_topics_count": len([h for h in self.topic_heat.values() if h > 0.5])
             }
 
 

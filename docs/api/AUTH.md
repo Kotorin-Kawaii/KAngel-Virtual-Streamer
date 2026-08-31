@@ -2,16 +2,17 @@
 
 ## 设计选择
 
-注册和登录使用 HTTP。凭据交换需要明确的状态码、请求校验及未来的限流能力，不适合混入持续连接的弹幕 WebSocket。登录成功后返回不透明 Bearer Token，并设置同值的 `HttpOnly` Cookie；同源浏览器建立弹幕 WebSocket 时会自动携带 Cookie。
+注册和登录使用 HTTP。凭据交换需要明确的状态码、请求校验及未来的限流能力，不适合混入持续连接的弹幕 WebSocket。浏览器登录成功后会得到两个 `HttpOnly` Cookie：access Cookie 用于常规 HTTP/WebSocket 鉴权，refresh Cookie 只用于刷新会话；同源浏览器建立弹幕 WebSocket 时会自动携带 access Cookie。
 
 - HTTP 基础地址示例：`http://localhost:8000`
 - WebSocket 地址：`ws://localhost:8000/danmaku`
 - 请求与响应编码：`application/json; charset=utf-8`
-- 当前令牌默认有效期：168 小时，可由 `AUTH__ACCESS_TOKEN_TTL_HOURS` 配置。
-- Cookie 名称默认是 `kangel_access_token`，可由 `AUTH__COOKIE_NAME` 配置。
+- access token 默认有效期：168 小时，可由 `AUTH__ACCESS_TOKEN_TTL_HOURS` 配置；Cookie 名称默认是 `kangel_access_token`，可由 `AUTH__COOKIE_NAME` 配置。
+- refresh token 默认有效期：720 小时，可由 `AUTH__REFRESH_TOKEN_TTL_HOURS` 配置；Cookie 名称默认是 `kangel_refresh_token`，可由 `AUTH__REFRESH_COOKIE_NAME` 配置。
+- refresh Cookie 的 Path 固定为 `/auth/refresh`，每次成功刷新都会轮换，已使用的 refresh token 不能再次使用。
 - 生产 HTTPS 环境应设置 `AUTH__COOKIE_SECURE=true`。
 - 未携带令牌的 WebSocket 保持现有游客行为。
-- 携带无效或过期令牌时不会降级为游客，而是以 WebSocket 关闭码 `1008` 拒绝连接。
+- 携带无效或过期令牌的 WebSocket 会安全降级为游客连接；HTTP 认证接口仍返回 `401`。
 
 ## 1. 创建账号
 
@@ -58,7 +59,10 @@
 
 ```http
 Set-Cookie: kangel_access_token=<token>; HttpOnly; Secure; Max-Age=604800; Path=/; SameSite=none; Partitioned
+Set-Cookie: kangel_refresh_token=<token>; HttpOnly; Secure; Max-Age=2592000; Path=/auth/refresh; SameSite=none; Partitioned
 ```
+
+浏览器前端应忽略 JSON 中为非浏览器客户端保留的 `access_token`，不得写入 `localStorage`、`sessionStorage`、IndexedDB 或应用状态持久化层。
 
 ### 错误响应
 
@@ -111,7 +115,52 @@ curl -X POST http://localhost:8000/auth/login \
   -d '{"username":"alice_01","password":"a-strong-password"}'
 ```
 
-## 3. 修改昵称与昵称历史
+## 3. 刷新浏览器登录态
+
+`POST /auth/refresh`
+
+该接口没有请求体，也不接受 `Authorization` 或 access token。浏览器以 `credentials: "include"` 调用，服务端只读取 `HttpOnly` refresh Cookie；成功时轮换 refresh token，并重新设置 access/refresh 两个 `HttpOnly` Cookie。
+
+成功状态码：`200 OK`
+
+```json
+{
+  "account": {
+    "account_id": "4fcd6163-5f63-43c2-ab7c-1b8d0db32677",
+    "username": "alice_01",
+    "nickname": "小爱",
+    "nickname_version": 1,
+    "created_at": "2026-07-02T04:00:00+00:00"
+  },
+  "expires_at": "2026-07-09T04:00:00+00:00"
+}
+```
+
+响应不会返回 access 或 refresh token。refresh Cookie 缺失、失效、过期或已被使用时返回 `401`（`登录状态已过期，请重新登录`）。
+
+页面恢复登录态的固定流程：先请求 `GET /auth/profile`；仅在它返回 `401` 时调用一次 refresh；refresh 成功后只重试 profile 一次；profile 成功后关闭旧 WebSocket 并重新连接 `/danmaku`，使握手携带新的 access Cookie。refresh 或重试后的 profile 仍为 `401` 时，才清除前端登录 UI 并要求重新登录。网络错误、`429`、`5xx` 不表示退出登录，不应触发刷新循环或清理 UI。
+
+```javascript
+async function restoreBrowserSession(reconnectDanmaku) {
+  let profile = await fetch("/auth/profile", { credentials: "include" });
+  if (profile.status === 401) {
+    const refreshed = await fetch("/auth/refresh", {
+      method: "POST",
+      credentials: "include",
+    });
+    if (refreshed.status === 401) return null;
+    if (refreshed.status !== 200) throw new Error("refresh request failed");
+    profile = await fetch("/auth/profile", { credentials: "include" });
+  }
+  if (profile.status === 401) return null;
+  if (profile.status !== 200) throw new Error("profile request failed");
+  const account = await profile.json();
+  reconnectDanmaku();
+  return account;
+}
+```
+
+## 4. 修改昵称与昵称历史
 
 以下接口必须携带登录 Cookie，或者使用请求头：
 
@@ -191,7 +240,7 @@ Authorization: Bearer <access_token>
 
 主播仅会获得一次“该登录观众近期改过名”的提示，默认有效期为 14 天。为了避免在公开直播中暴露隐私，旧昵称原文不会进入 AI 回复提示；主播可以自然注意到改名，但不能念出或猜测旧名。
 
-## 4. 人物记忆与隐私控制
+## 5. 人物记忆与隐私控制
 
 登录用户可以查询、导出、清除或关闭人物长期记忆。完整请求、响应及脱敏规则见 [账号人物记忆与隐私接口](../concepts/MEMORY_PRIVACY.md)。
 
@@ -204,7 +253,7 @@ Authorization: Bearer <access_token>
 
 这些接口只能操作当前访问令牌所属账号，不能由客户端传入其他 `account_id`。
 
-## 5. 携带登录身份连接弹幕 WebSocket
+## 6. 携带登录身份连接弹幕 WebSocket
 
 ### 浏览器推荐方式：HttpOnly Cookie
 
@@ -244,7 +293,7 @@ const ws = new WebSocket(
 
 对于登录连接，服务端以账号记录中的昵称为准，忽略弹幕负载中伪造或过期的昵称；对于游客连接，仍使用消息中的昵称。弹幕负载中的 `account_id` 或 `user_id` 字段不会被信任。
 
-## 6. 游客连接
+## 7. 游客连接
 
 不传令牌即可保持原有行为：
 
@@ -254,18 +303,18 @@ const ws = new WebSocket("ws://localhost:8000/danmaku");
 
 游客会获得仅在当前连接有效的临时身份。相同昵称的不同游客不会共享账号关系，也不会自动继承旧昵称数据。
 
-## 7. 前端保存建议
+## 8. 前端保存建议
 
-1. 同源浏览器优先使用服务端设置的 `HttpOnly` Cookie，不要由 JavaScript 复制令牌。
+1. 同源浏览器只使用服务端设置的 `HttpOnly` access/refresh Cookie，不要由 JavaScript 复制、缓存或持久化任何令牌。
 2. 生产环境必须使用 HTTPS/WSS，并设置 `AUTH__COOKIE_SECURE=true`。
 3. 查询参数仅用于 Cookie 不可用的客户端；不要把含令牌 URL 写入日志、埋点、错误上报或分享内容。
-4. 收到 HTTP `401` 或 WebSocket `1008` 后清除本地登录状态并引导用户重新登录。
+4. `GET /auth/profile` 首次 `401` 时，先调用一次 `/auth/refresh` 并重试 profile；仅当 refresh 或重试仍是 `401` 时才清除本地登录状态。WebSocket 携带失效令牌时会降级为游客，不应把它误判为已登录连接。
 5. `account_id` 仅用于前端关联账号数据，不能替代访问令牌进行认证。
 6. 登录账号只能通过 `PATCH /auth/profile/nickname` 改名，不要通过弹幕字段尝试修改昵称。
 
 ## 8. 当前安全边界与后续项
 
 - 密码以 scrypt + 每账号随机盐保存。
-- 数据库仅保存访问令牌的 SHA-256 摘要，不保存令牌明文。
+- 数据库仅保存 access/refresh 令牌的 SHA-256 摘要，不保存令牌明文。
 - 账号 ID 为不可变 UUID；用户名和昵称都不是记忆归属键。
 - 当前尚未提供登出、令牌主动吊销、密码修改、找回密码和登录限流；这些属于账号系统后续增强项。

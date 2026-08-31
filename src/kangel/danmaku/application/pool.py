@@ -176,6 +176,16 @@ class DanmakuPool:
                         )
                         return True
         return False
+
+    async def claim_for_reply(self, danmaku_id: str) -> bool:
+        """在池锁内把仍可回复的候选原子标为 SELECTED。"""
+        async with self._lock:
+            for pool in (self._unread_pool, self._read_pool):
+                for item in pool:
+                    if item.id == danmaku_id and item.is_available_for_reply():
+                        item.status = DanmakuStatus.SELECTED
+                        return True
+        return False
     
     async def get_unread_danmaku(self, limit: int = None) -> List[DanmakuItem]:
         """获取未读弹幕列表（自动过滤过期弹幕）"""

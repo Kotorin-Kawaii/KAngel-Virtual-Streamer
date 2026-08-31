@@ -1,5 +1,9 @@
 """Stream 领域排期模型。"""
 
 from .schedule import ScheduleSnapshot, StreamScheduleService
+from .mainline import DailyStreamPlanBeat, DailyStreamPlanSnapshot, StreamMainlineState
 
-__all__ = ["ScheduleSnapshot", "StreamScheduleService"]
+__all__ = [
+    "DailyStreamPlanBeat", "DailyStreamPlanSnapshot", "StreamMainlineState",
+    "ScheduleSnapshot", "StreamScheduleService",
+]

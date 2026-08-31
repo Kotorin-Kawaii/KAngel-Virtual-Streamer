@@ -32,6 +32,7 @@ MutationHandler = Callable[[PersonaMutation], object]
 
 
 class PersonaEventLog(Protocol):
+    def claim(self, event: PersonaEvent) -> bool: ...
     def append(self, record: dict) -> None: ...
 
 
@@ -72,6 +73,7 @@ class PersonaEventPipeline:
         self._history: deque[dict] = deque(maxlen=100)
         self._processed_order: deque[str] = deque(maxlen=2048)
         self._processed_ids: set[str] = set()
+        self._observers: list[Callable[[PersonaEvent, dict], object]] = []
 
     @property
     def current_danmaku_rate(self) -> int:
@@ -84,12 +86,28 @@ class PersonaEventPipeline:
         return sum(self._recent_sentiments) / len(self._recent_sentiments)
 
     @property
+    def audience_sentiment_sample_count(self) -> int:
+        """房间氛围聚合样本数；供长时锚点拒绝单条弹幕写入。"""
+        return len(self._recent_sentiments)
+
+    @property
     def queue_size(self) -> int:
         return self._queue.qsize()
 
     def bind(self, state_provider: StateProvider, mutation_handler: MutationHandler) -> None:
         self._state_provider = state_provider
         self._mutation_handler = mutation_handler
+
+    def add_observer(self, observer: Callable[[PersonaEvent, dict], object]) -> None:
+        """注册只读观察者；观察失败不得影响人格状态提交。"""
+        if observer not in self._observers:
+            self._observers.append(observer)
+
+    def remove_observer(self, observer: Callable[[PersonaEvent, dict], object]) -> None:
+        try:
+            self._observers.remove(observer)
+        except ValueError:
+            pass
 
     async def publish(
         self,
@@ -131,16 +149,22 @@ class PersonaEventPipeline:
     async def stop(self) -> None:
         if not self._running:
             return
+        # 先停生产者，再让单消费者排空已接收事件。旧实现同时 cancel 两者，
+        # 会在 tick 已入队但 future 尚未完成时丢掉人格 mutation。
+        if self._tick_task:
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except asyncio.CancelledError:
+                pass
+        await self._queue.join()
         self._running = False
-        for task in (self._tick_task, self._worker_task):
-            if task:
-                task.cancel()
-        for task in (self._tick_task, self._worker_task):
-            if task:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
         self._tick_task = None
         self._worker_task = None
         while not self._queue.empty():
@@ -168,6 +192,11 @@ class PersonaEventPipeline:
     async def _process(self, event, state, internal_state, mutation_handler):
         if event.event_id in self._processed_ids:
             return PersonaMutation(reason="重复事件已忽略")
+        if isinstance(event, SemanticImpactAnalyzedEvent) and self.event_log:
+            claim = getattr(self.event_log, "claim", None)
+            if callable(claim) and not claim(event):
+                self._remember_event(event.event_id)
+                return PersonaMutation(reason="重复来源语义影响已忽略")
         if isinstance(event, DanmakuReceivedEvent):
             self._last_activity_at = _as_utc(event.occurred_at)
             self._current_danmaku_rate = max(0, event.danmaku_rate)
@@ -203,6 +232,13 @@ class PersonaEventPipeline:
             except Exception as exc:
                 # 回放日志不得在状态已提交后诱发业务重试或重复 mutation。
                 logger.error("人格事件回放日志写入失败: %s", exc)
+        for observer in tuple(self._observers):
+            try:
+                result = observer(event, snapshot)
+                if inspect.isawaitable(result):
+                    asyncio.create_task(result)
+            except Exception as exc:
+                logger.debug("人格事件只读观察者失败: %s", exc)
         return mutation
 
     def _remember_event(self, event_id: str) -> None:

@@ -1,9 +1,9 @@
 [project]
 name = "kangel-server"
-version = "0.1.0"
-description = "虚拟主播直播系统 - 支持RAG增强的弹幕回复生成"
+version = "0.3.0"
+description = "AI virtual streamer backend with persistent persona, viewer continuity, WebSocket interaction and OpenAI-compatible model support"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "fastapi==0.104.1",
     "pydantic==2.5.0",
@@ -13,7 +13,10 @@ dependencies = [
     "lancedb>=0.5.0",
     "numpy>=1.24.0",
     "fastembed>=0.2.0",
+    "onnxruntime==1.19.2",
     "scikit-learn>=1.3.0",
+    "psutil>=5.9.0",
+    "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.scripts]

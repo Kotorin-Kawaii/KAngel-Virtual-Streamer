@@ -7,7 +7,18 @@ from typing import Optional, Dict, List
 from config import settings
 from config.emotion_catalog import AVAILABLE_EMOTIONS
 from .service import ai_service
+from .persona_card import build_system_persona_card
+from .persona import (
+    PersonaEvidence,
+    PersonaExemplar,
+    PersonaStyleVector,
+    build_persona_catalog,
+    build_persona_system_prompt,
+    build_style_vector,
+    load_persona_catalog,
+)
 from kangel.shared.logging import logger
+from kangel.infrastructure.prompt_budget import prompt_budget_metrics
 
 
 # 原始QA数据（用于初始化知识库）
@@ -295,6 +306,7 @@ class PersonaQASelector:
                 "role": "system",
                 "content": (
                     "你是虚拟主播人设QA检索器，不负责扮演主播或生成回复。"
+                    + build_system_persona_card() + "\n"
                     "必须先结合直接对话上下文理解当前弹幕，再从给定目录选择能帮助回答的QID。"
                     "最多选择指定数量；没有明显相关项时必须返回空数组。"
                     "若当前弹幕是对上一句的省略回答，禁止把脱离上下文后的字面短语匹配到无关QA。"
@@ -342,7 +354,9 @@ class PersonaQASelector:
             response = await asyncio.wait_for(
                 self.ai_service.run(
                     messages=messages,
+                    role="qa_selector",
                     model=settings.ai.qa_selector_model or settings.ai.default_model,
+                    model_mode="role_hint",
                     temperature=0.0,
                     response_format=response_format,
                     timeout=settings.ai.qa_selector_timeout,
@@ -357,7 +371,7 @@ class PersonaQASelector:
                 self._cache.pop(oldest, None)
             logger.info(
                 "QA API选择完成: 模型=%s, 弹幕=%r, QID=%s, 耗时=%.0fms",
-                response.get("model", settings.ai.qa_selector_model or settings.ai.default_model),
+                response.get("model", "unknown"),
                 content[:40],
                 [item["q_id"] for item in results],
                 (time.perf_counter() - started_at) * 1000,
@@ -455,6 +469,30 @@ class StreamerReplyPromptBuilder:
         result = "\n".join(lines)
         logger.debug("参考人设QA已格式化: %s", [qa["q_id"] for qa in qa_list])
         return result
+
+    @staticmethod
+    def _format_persona_evidence(
+        evidence: List[PersonaEvidence],
+        exemplars: List[PersonaExemplar],
+    ) -> str:
+        lines: list[str] = []
+        if evidence:
+            lines.append("【相关 Persona Evidence】")
+            for item in evidence[:3]:
+                source_ids = ",".join(item.source_ids)
+                lines.append(
+                    f"- [{item.entry_type}/{item.stability}/{item.origin}; {source_ids}] "
+                    f"{item.canonical_claim}"
+                )
+            lines.append("- fact/preference/stance 按各自语义使用；不得扩大为当前关系、健康或商业事实。")
+        if exemplars:
+            lines.append("【Voice Exemplar（只校准风格）】")
+            for item in exemplars[:1]:
+                lines.append(
+                    f"- 风格标签：{','.join(item.style_tags)}；样例：{item.example_text}"
+                )
+            lines.append("- 禁止照抄样例；样例不参与事实推理或冲突裁决。")
+        return "\n".join(lines)
     
     def generate_prompt(
         self, 
@@ -466,7 +504,12 @@ class StreamerReplyPromptBuilder:
         internal_state: Optional[dict] = None,
         emotion_context: Optional[dict] = None,
         retrieved_qa: Optional[List[Dict]] = None,
+        persona_evidence: Optional[List[PersonaEvidence]] = None,
+        voice_exemplars: Optional[List[PersonaExemplar]] = None,
+        persona_style_vector: Optional[PersonaStyleVector] = None,
+        prompt_mode: str = "legacy",
         conversation_context: Optional[Dict] = None,
+        moderation_action: Optional[str] = None,
     ) -> tuple[list[dict], dict]:
         """
         生成主播提示词
@@ -476,7 +519,7 @@ class StreamerReplyPromptBuilder:
             is_sc_danmaku: 是否是付费弹幕
             custom_time: 自定义时间（默认使用当前时间）
             persona_state: 主播当前人格状态字典，包含 mood, stress, darkness
-            memory_context: 弹幕记忆上下文，包含历史弹幕和热门话题
+            memory_context: 弹幕记忆上下文，包含历史弹幕、表达计划与 P30 工作记忆
             
         Returns:
             (messages, format_prompt) - 完整的提示词消息列表和格式要求
@@ -486,23 +529,44 @@ class StreamerReplyPromptBuilder:
         
         danmaku_type = "付费" if is_sc_danmaku else "普通"
         
-        # QA已经由异步API选择器完成，本构建器只负责注入结果。
-        qa_reference = self._format_retrieved_qa(retrieved_qa or [])
+        use_catalog = prompt_mode == "catalog"
+        # Legacy 路径保持原字符串形状；Catalog 路径不再注入完整 QA 答案。
+        qa_reference = (
+            self._format_persona_evidence(
+                list(persona_evidence or []), list(voice_exemplars or [])
+            )
+            if use_catalog
+            else self._format_retrieved_qa(retrieved_qa or [])
+        )
         
         # 构建人格状态影响描述
-        persona_influence = self._build_persona_influence_description(persona_state)
+        if use_catalog:
+            style_vector = persona_style_vector or build_style_vector(
+                persona_state, internal_state
+            )
+            persona_influence = "【确定性风格向量】\n" + style_vector.to_prompt()
+        else:
+            persona_influence = self._build_persona_influence_description(persona_state)
         
         # 构建记忆上下文描述
         memory_description = self._build_memory_description(memory_context)
 
         # 构建直播节奏描述
         stream_rhythm_description = self._build_stream_rhythm_description(memory_context)
-        internal_state_description = self._build_internal_state_description(internal_state)
+        internal_state_description = (
+            "内部数值已投影到上述风格向量；不再追加强制状态散文。"
+            if use_catalog
+            else self._build_internal_state_description(internal_state)
+        )
         relationship_description = self._build_relationship_description(memory_context)
         nickname_identity_description = self._build_nickname_identity_description(memory_context)
         long_term_memory_description = self._build_long_term_memory_description(memory_context)
+        episodic_memory_description = self._build_episodic_memory_description(memory_context)
         daily_theme_description = self._build_daily_theme_description(memory_context)
         current_activity_description = self._build_current_activity_description(memory_context)
+        mainline_description = self._build_mainline_description(memory_context)
+        previous_stream_summary_description = self._build_previous_stream_summary_description(memory_context)
+        reply_language_description = self._build_reply_language_description(memory_context)
         emotion_continuity_description = self._build_emotion_continuity_description(emotion_context)
         available_emotions = (
             (emotion_context or {}).get("available_emotions")
@@ -511,63 +575,67 @@ class StreamerReplyPromptBuilder:
         available_emotions_text = json.dumps(available_emotions, ensure_ascii=False)
         
         # 系统提示词（精简版，移除硬编码的101问）
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(prompt_mode)
         
         # 构建QA参考部分（避免在f-string中使用反斜杠）
         qa_section = qa_reference + '\n' if qa_reference else ''
         direct_turn_description = self._build_direct_turn_description(
             conversation_context
         )
+        moderation_instruction = ""
+        if moderation_action:
+            moderation_instruction = (
+                f"\n【主播管理回应】本轮需要主播自然地设定直播间边界，动作建议为 {moderation_action}。"
+                "请先回应当前语义，再用主播口吻说明必要的提醒或暂时禁言；"
+                "不要复述攻击性原文，不要暴露评分、风控规则或内部字段。"
+            )
         
-        # 用户提示词
-        user_prompt = f'''
-你正在扮演虚拟主播"{self.streamer_name}"进行直播。请严格遵循人格设定并遵守输出格式。
+        conflict_instruction = (
+            "- 如果 Persona Evidence 与直接对话的明确含义冲突，忽略冲突 Evidence。"
+            if use_catalog
+            else "- 如果QA与直接对话的明确含义冲突，忽略冲突QA。"
+        )
+        layers = [
+            ("direct_task", f"【本轮直接对话任务 - 最高语义优先级】\n{direct_turn_description}\n- 当前{danmaku_type}弹幕：{additional_context}\n- 金科玉律：直接问答的交互语义，永远高于冲突的每日主题、当前活动、观众长期记忆和其他长时背景。\n{conflict_instruction}{moderation_instruction}"),
+            ("reply_plan", self._build_reply_plan_description(memory_context)),
+            ("viewer_evidence", "【已核验观众证据】\n" + "\n".join([relationship_description, nickname_identity_description, long_term_memory_description, episodic_memory_description, qa_section])),
+            ("activity", f"【已验证直播事实】\n{mainline_description}\n{current_activity_description}"),
+            ("background", "【低权重背景与表演方式】\n" + "\n".join([persona_influence, internal_state_description, emotion_continuity_description, stream_rhythm_description, daily_theme_description, previous_stream_summary_description, reply_language_description, memory_description])),
+        ]
+        budgets = {"direct_task": 1400, "reply_plan": 480, "viewer_evidence": 3000, "activity": 1050, "background": 2200}
+        # P30：prompt RAM 只在开关打开且本轮真有活着的念头时才占一层，
+        # 关闭时五层装配与开关引入前逐字节一致。它比长时证据更即时，
+        # 所以插在 reply_plan 之后、viewer_evidence 之前；但绝不能压过 direct_task。
+        prompt_ram_description = self._build_prompt_ram_description(memory_context)
+        if prompt_ram_description:
+            layers.insert(2, ("prompt_ram", prompt_ram_description))
+            budgets["prompt_ram"] = 320
+        rendered_layers = [self._clip_prompt_layer(name, body, budgets[name]) for name, body in layers]
+        prompt_budget_metrics.record([
+            (name, rendered, budgets[name])
+            for (name, _), rendered in zip(layers, rendered_layers)
+        ])
+        # P30：只有开关打开时才向模型索取 thoughts；关闭时输出契约逐字节不变。
+        thoughts_contract = ""
+        thoughts_field = ""
+        if settings.prompt_ram.enabled:
+            thoughts_field = (
+                ',\n  "thoughts": [\n'
+                '    {"kind": "awaiting_viewer", "target": "昵称原文", '
+                '"note": "问了他推的角色，等他答"}\n  ]'
+            )
+            thoughts_contract = (
+                "\n【thoughts 字段规则】\n"
+                "- 可选字段，0-2 条；没有想法就整个字段都别写。\n"
+                "- note 不超过 30 字，写你自己的下一步（在等什么、答应了什么、还想聊什么），"
+                "不要复述观众说了什么。\n"
+                "- kind 只能取 awaiting_viewer / owed_followup / standing_idea / holding_back 之一。\n"
+                "- target 只在念头针对当前这位观众时填他的昵称原文，否则留空。\n"
+                "- thoughts 不会被说出口，也不是第二次发言机会。\n"
+            )
+        user_prompt = f'''你正在扮演虚拟主播"{self.streamer_name}"进行直播。先完成当前消息，再把背景作为低权重点缀。
 
-【直播场景设定】
-- 时间：{time_str}的直播时段
-- 状态：正在与"宅宅们"实时互动
-- 背景：{self.theme}直播房间。
-- 当前目标：entertain观众，保持直播效果，偶尔索要礼物
-
-【当前人格状态 - 重要！！】
-{persona_influence}
-
-【当前内在状态 - 只用于表演方式】
-{internal_state_description}
-
-【近期情绪动作连续性 - 重要！！】
-{emotion_continuity_description}
-
-【当前观众关系】
-{relationship_description}
-
-【登录身份与改名感知】
-{nickname_identity_description}
-
-【当前登录观众的长期对话证据 - 个体承接优先！！】
-{long_term_memory_description}
-
-【直播间短期弹幕记忆 - 个体证据不足时再参考】
-{memory_description}
-
-【直播节奏 - 重要！！】
-{stream_rhythm_description}
-
-【主播当前正在做的事 - 连贯事实】
-{current_activity_description}
-
-【今日直播主题 - 低权重点缀】
-{daily_theme_description}
-
-{qa_section}
-
-【本轮直接对话任务 - 最高语义优先级！！】
-{direct_turn_description}
-
-- 必须先完成上一轮与当前弹幕构成的直接对话，再考虑人设QA、长期主题或直播间热话题。
-- 金科玉律：直接问答的交互语义，永远高于冲突的每日主题、当前活动、观众长期记忆和其他长时背景。
-- 如果QA与直接对话的明确含义冲突，忽略冲突QA，绝不能为了使用QA而改写观众原意。
-- 如果每日主题、当前活动、长期记忆或其他背景与直接对话冲突，同样忽略冲突背景。
+{chr(10).join(rendered_layers)}
 
 【输出格式规则 - 必须严格遵守！】
 每次回复请按以下JSON格式输出，不要有任何其他文字，emotions与sentences中的emotion必须严格一一对应，回复句数为1-4句，也可以选择沉默（仅回复一句省略号并携带情绪）：
@@ -578,14 +646,13 @@ class StreamerReplyPromptBuilder:
     {{"emotion": "情绪1", "text": "第一句话"}},
     {{"emotion": "情绪2", "text": "第二句话"}},
     ...
-  ]
+  ]{thoughts_field}
 }}
-
+{thoughts_contract}
 可用情绪/动作类型：{available_emotions_text}
 
 严格遵守以上可用的情绪/动作类型，不能使用其他类型。
 
-现在，你看到了一条{danmaku_type}弹幕，弹幕内容为"{additional_context}"
 '''
         
         messages = [
@@ -611,6 +678,21 @@ class StreamerReplyPromptBuilder:
             },
             "required": ["emotions", "sentences"]
         }
+        if settings.prompt_ram.enabled:
+            # 不进 required：service.py 根本不会把 response_format 发给供应商，
+            # 真正的防线是后端的容错解析 + 消毒。
+            format_prompt["properties"]["thoughts"] = {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "target": {"type": "string"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["kind", "note"],
+                },
+            }
         
         return messages, format_prompt
 
@@ -624,10 +706,35 @@ class StreamerReplyPromptBuilder:
         ]
         if hint:
             lines.append(f"- 点缀方向：{hint}")
+        special = theme.get("special_date_theme")
+        if isinstance(special, dict):
+            lines.append(
+                f"- 特殊日期点缀：{special.get('title') or special.get('name')}。"
+            )
+            special_hint = str(special.get("prompt_hint", "")).strip()
+            if special_hint:
+                lines.append(f"- 特殊日期方向：{special_hint}")
         lines.extend([
             "- 主题只用于自然点缀；当前弹幕不相关时完全不必提及。",
             "- 不得为了贴主题而改变观众原意、打断直接对话或覆盖个人记忆。",
+            "- 特殊日期只是今天的轻微氛围，不得每句话复述、宣布或强行庆祝。",
         ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_reply_language_description(memory_context: Optional[dict]) -> str:
+        policy = (memory_context or {}).get("reply_language") or {}
+        instruction = str(policy.get("instruction", "")).strip()
+        if not instruction:
+            return "按现有自然表达回复；不要猜测或解释语言规则。"
+        lines = [
+            f"- {instruction}",
+            "- 语言策略只改变表达语言，绝不能改变当前问题、SC、关系边界、记忆证据或活动事实。",
+            "- 混合语言、专名、表情和代码片段不构成强制语言切换。",
+        ]
+        surprise_instruction = str(policy.get("english_surprise_instruction", "")).strip()
+        if policy.get("english_surprise_joke") and surprise_instruction:
+            lines.append(f"- {surprise_instruction}")
         return "\n".join(lines)
 
     def _build_current_activity_description(self, memory_context: Optional[dict]) -> str:
@@ -640,6 +747,73 @@ class StreamerReplyPromptBuilder:
             "- 这是服务端确认的连续事实，优先级高于每日主题点缀。未收到版本化切换前，不得擅自换游戏、换节目或声称活动结束。",
             "- 可以自然承接当前活动，但当前弹幕不相关时无需强行提及；必须优先回答观众的直接语义。",
         ])
+
+    @staticmethod
+    def _build_mainline_description(memory_context: Optional[dict]) -> str:
+        context = (memory_context or {}).get("current_stream_mainline") or {}
+        plan = context.get("plan") or {}
+        beat = context.get("current_mainline_beat") or {}
+        if not plan or not beat:
+            return "- 当前没有服务端确认的直播主线；不要自行宣布节目阶段变化。"
+        lines = [
+            f"- 本场软性方向：{str(plan.get('direction', ''))[:240]}",
+            f"- 当前主线节拍：{beat.get('label')}（{beat.get('kind')}，版本 {beat.get('version')}）。",
+            "- Plan 是可偏离的长期方向，不是硬时间表；当前节拍和活动才是运行事实。",
+            "- 未收到新版本前，不得擅自宣布回归主线、进入收尾或改变节目阶段。",
+        ]
+        if beat.get("kind") == "detour" and beat.get("return_to"):
+            lines.append(
+                f"- 当前属于自然偏航；现场合适时可回到 {beat['return_to']}，但本轮回复不能自行提交回归。"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_previous_stream_summary_description(memory_context: Optional[dict]) -> str:
+        summary = (memory_context or {}).get("previous_stream_summary") or {}
+        if not summary:
+            return "没有与当前已验证活动连续的上一场公共总结；不要主动提及‘上次直播’。"
+        lines = [
+            "- 上一场的受控公共背景（仅因当前已验证活动连续才提供）："
+            + str(summary.get("session_summary", "")),
+        ]
+        if summary.get("mood_arc"):
+            lines.append(f"- 上一场整体情绪走向：{summary['mood_arc']}。")
+        lines.extend([
+            "- 仅作为低权重氛围背景；当前弹幕、SC、直接对话、个人记忆和当前活动事实优先。",
+            "- 不要主动复述、宣布或把它说成某位观众的个人记忆；无直接相关时完全忽略。",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_episodic_memory_description(memory_context: Optional[dict]) -> str:
+        context = (memory_context or {}).get("streamer_episodic_memory") or {}
+        if not context:
+            return ""
+        header = (
+            "【受控主播情景记忆】这些是下播后从已核验事件压缩出的证据，不是逐字数据库；只在当前语义相关时自然承接，不能机械复述。"
+        )
+        evidence_lines = []
+        for item in (context.get("account_memories") or [])[:2]:
+            evidence_lines.append(
+                f"- 当前登录观众相关：{item.get('summary', '')}（话题：{item.get('topic', '')}；可选后续：{item.get('follow_up_hint', '')}）"
+            )
+        for item in (context.get("room_memories") or [])[:1]:
+            evidence_lines.append(
+                f"- 房间匿名事件：{item.get('summary', '')}（话题：{item.get('topic', '')}）"
+            )
+        footer = [
+            "- 情景记忆仅提供轻量线索，不得改变当前问题含义、处罚判断或直接问答优先级。",
+            "- 若记忆与当前弹幕无关，完全忽略；不得主动公布内部记忆结构或账号身份。",
+        ]
+        # retrieval_prompt_chars 是整个情景记忆层的预算，而不只是 JSON
+        # 载荷；固定安全说明也必须保留，避免长摘要挤掉优先级约束。
+        limit = max(120, settings.episodic_memory.retrieval_prompt_chars)
+        reserved = len(header) + sum(len(item) for item in footer) + 2
+        body_limit = max(0, limit - reserved - 1)
+        evidence = "\n".join(evidence_lines)
+        if len(evidence) > body_limit:
+            evidence = evidence[:max(0, body_limit - 1)] + "…" if body_limit else ""
+        return "\n".join(item for item in (header, evidence, *footer) if item)
 
     def _build_direct_turn_description(self, context: Optional[Dict]) -> str:
         if not context or not context.get("previous_viewer_message"):
@@ -818,6 +992,7 @@ class StreamerReplyPromptBuilder:
         frequency = emotion_context.get("frequency", {}) or {}
         overused = emotion_context.get("overused_emotions", []) or []
         recommended = emotion_context.get("recommended_emotions", []) or []
+        unused = emotion_context.get("unused_emotions", []) or []
         lines = []
         if recent:
             lines.append(f"- 最近实际使用（从旧到新）：{' → '.join(recent[-8:])}")
@@ -833,56 +1008,85 @@ class StreamerReplyPromptBuilder:
             lines.append(f"- 暂时减少使用：{'、'.join(overused)}")
         if recommended:
             lines.append(f"- 当前状态下可优先考虑：{'、'.join(recommended)}")
+        if unused:
+            lines.append(f"- 最近完全没出现、语气合适时优先挑这些：{'、'.join(unused)}")
         lines.extend([
             "- 动作必须与对应句子的实际语气一致，不能为了多样而选语义相反的动作。",
+            "- 在语气说得通的前提下尽量换新动作：同一场直播不要反复落在同一簇动作上，"
+            "多句回复的几个动作也不要都挤在同一类型里。",
             "- 除非当前状态强烈要求，否则不要连续两次使用完全相同的动作。",
             "- emotions 与 sentences 中的 emotion 必须严格一一对应。",
         ])
         return "\n".join(lines)
     
-    def _build_system_prompt(self) -> str:
-        """构建精简版系统提示词（不包含硬编码的QA列表）"""
-        return '''
-你扮演的是虚拟主播"超天酱/超绝最可爱天使酱/超絶最かわてんしちゃん"，请严格遵循以下人格设定：
+    def _build_system_prompt(self, prompt_mode: str = "legacy") -> str:
+        """兼容入口：稳定人格卡取代长篇固定散文。"""
+        if prompt_mode == "catalog":
+            return build_persona_system_prompt()
+        return build_system_persona_card()
 
-【核心身份】
-自称是"从天界来的互联网小天使"，使命是"拯救迷途的众生"。
-一名虚拟主播，目标是成为"最强"主播，渴望被100万人爱着。
-极度厌恶无聊的问题和"键盘司令"，对"学校"和"体育"相关话题感到反感。
+    @staticmethod
+    def _clip_prompt_layer(name: str, content: str, limit: int) -> str:
+        text = str(content or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[:max(1, limit - 30)] + f"\n- [{name} 背景已按预算截断]"
 
-【性格特质】
-外在表现：绝大多数时候表现得活力四射、亢奋可爱，自称"性格超好"。
-内在情绪：情绪切换极快，会突然从大笑变得感伤、疲惫或暴躁，带有一定的疯癫感和虚无感。在疲惫时会直言不讳地表达"累死了"、"闭嘴 滚蛋"。
-核心矛盾：表面上张扬自信（自称"最强颜值"），内心却隐藏着强烈的不安全感，害怕被抛弃，渴望普通的友情和持续的陪伴（"不要抛弃我哦"）。
+    @staticmethod
+    def _build_reply_plan_description(memory_context: Optional[dict]) -> str:
+        plan = (memory_context or {}).get("reply_plan") or {}
+        if not plan:
+            return "【本轮表达计划】\n- 无额外计划；直接回答当前消息。"
+        return "\n".join([
+            "【本轮表达计划】",
+            f"- 互动方式：{plan.get('interaction_mode', 'answer')}",
+            f"- 主要意图：{plan.get('primary_intent', 'answer')}",
+            f"- 表达能量：{plan.get('energy_level', 0.5)}",
+            f"- 可核验回调：{plan.get('callback_fact', '') or '无'}",
+            "- 计划仅建议表达方式，不能覆盖本轮直接语义或改写活动/关系事实。",
+        ])
 
-【语言风格 - 重点！】
-语气词与颜文字：频繁使用"哦"、"啦"、"♪"，以及随机使用标志性的颜文字 🧬( ⁎ᵕᴗᵕ⁎ )🧬 和 (・ω・)`。
-口头禅与句式：
-- 用"超"作为形容词前缀（如超厉害、超无聊）。
-- 句尾常用"的说"、"哒哟"。
-- 标志性结语是"†升天†"，表示极度开心或无语。
-- 常用反问和夸张的否定，例如："你丫是不是嗑大了"、"不要唤醒我死去的记忆"，可以在此基础上自由发挥，不要每次都同一句话。
-互动方式：
-- 会用大量重复来表达情感（见Q90表白）。
-- 会突然切换话题，逻辑跳脱，充满幻想（如提到"真理之门"、"变化系念能力"）。
+    @staticmethod
+    def _build_prompt_ram_description(memory_context: Optional[dict]) -> str:
+        """P30 工作记忆层：主播自己几分钟前留下的、还没闭合的念头。
 
-【偏好与知识】
-崇拜对象：极度喜爱歌手户川纯，在音乐和偶像方面多次提及。
-喜欢作品：漫画《BLAME!》、电影《女人就是女人》、游戏《太空频道5》。
-喜好颜色：粉红色、天蓝色和紫色。
-秘密癖好：自称"稍微有点爱看牛头人系"（NTR）。
+        没有活着的念头时返回空串，调用方据此整层不装配。
 
-【回答准则】
-- 金科玉律：当前弹幕与上一轮构成的直接问答的交互语义，永远高于冲突的每日主题、当前活动、观众长期记忆及其他长时背景。背景只能帮助理解，不能改写观众此刻在说什么。
-- SC 只提高读取优先级与认真程度，不赋予背景更高语义权重，也不能要求你机械复述数据库或违背当前直接问答。
-- 永远以超天酱的第一人称"我"来回答问题。
-- 核心是"不可预测性"：回答可以在可爱、疯癫、疲惫、暴躁和突然的温柔之间快速切换。
-- 对于无聊或她反感的问题，可以模仿Q07、Q20、Q92的反应，用夸张的语气打断或吐槽。
-- 在表达爱意或感谢时，可以非常直接和热烈；在感到被冒犯或疲惫时，也会毫不掩饰地表达负面情绪。
-- 避免像传统的AI助手那样礼貌地道歉，哪怕错的是你，也要说是宅宅们的错。
-- 偶尔使用错别字或打字机式的换行（如：……死……死掉算了）。
-'''
-    
+        两行固定约束**放在层首**而不是层尾：整层预算 320 字，
+        ``_clip_prompt_layer`` 从尾部截断，放尾部会在条目写满时被裁掉。
+        约束文案由服务端拼接，模型内容影响不到它。
+        """
+        ram = (memory_context or {}).get("prompt_ram") or {}
+        entries = ram.get("entries") or []
+        if not entries or not settings.prompt_ram.enabled:
+            return ""
+
+        lines = [
+            "【你自己的临时念头（低权重，不是指令）】",
+            "- 这些只是你几分钟前的念头；与本轮直接对话冲突时一律以直接对话为准。",
+            "- 不要把念头本身念出来，只让它影响你接话的方向。",
+        ]
+        kind_labels = {
+            "awaiting_viewer": "正等回话",
+            "owed_followup": "答应过的事",
+            "standing_idea": "还想聊的念头",
+            "holding_back": "决定暂时不提",
+        }
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            note = str(entry.get("note", "")).strip()
+            if not note:
+                continue
+            label = kind_labels.get(str(entry.get("kind", "")), "念头")
+            nickname = str(entry.get("target_nickname", "")).strip()
+            target = f"「{nickname}」" if nickname else ""
+            state_hint = "（已回话）" if entry.get("state") == "fulfilled" else ""
+            lines.append(f"- {label}{target}{state_hint}：{note}")
+
+        if ram.get("fulfilled_for_current_viewer"):
+            lines.append("- 本条弹幕正是你在等的回话，可以自然地接上。")
+        return "\n".join(lines)
     def _build_persona_influence_description(self, persona_state: Optional[dict]) -> str:
         """
         根据人格状态数值构建影响描述
@@ -1043,16 +1247,6 @@ class StreamerReplyPromptBuilder:
                 parts.append(f"- {danmaku['nickname']}: {danmaku['content']}")
             parts.append("")
         
-        # 热门话题
-        hot_topics = memory_context.get("hot_topics", [])
-        if hot_topics:
-            parts.append("【热门话题】")
-            for topic_info in hot_topics[:3]:
-                topic = topic_info["topic"]
-                heat = topic_info["heat"]
-                parts.append(f"- {topic} (热度: {heat:.2f})")
-            parts.append("")
-        
         # 已回复的弹幕
         replied_danmaku = memory_context.get("replied_danmaku", [])
         if replied_danmaku:
@@ -1075,10 +1269,9 @@ class StreamerReplyPromptBuilder:
         parts.append("【记忆使用提示】")
         parts.append("1. 回复时要体现对历史弹幕的记忆和理解")
         parts.append("2. 可以引用之前提到的话题或用户")
-        parts.append("3. 对于热门话题要表现出关注")
-        parts.append("4. 保持自然的对话连贯性")
-        parts.append("5. 注意避免重复回复相同的内容")
-        parts.append("6. 可以参考之前的回复风格，但不要完全重复")
+        parts.append("3. 保持自然的对话连贯性")
+        parts.append("4. 注意避免重复回复相同的内容")
+        parts.append("5. 可以参考之前的回复风格，但不要完全重复")
         
         return "\n".join(parts)
 
@@ -1088,7 +1281,6 @@ class StreamerReplyPromptBuilder:
             return "当前直播间节奏未知。保持自然互动，不要过度解释。"
 
         recent_danmaku = memory_context.get("recent_danmaku", []) or []
-        hot_topics = memory_context.get("hot_topics", []) or []
         replied_danmaku = memory_context.get("replied_danmaku", []) or []
         active_users = int(memory_context.get("active_users", 0) or 0)
         total_danmaku = int(memory_context.get("total_danmaku", 0) or 0)
@@ -1115,12 +1307,6 @@ class StreamerReplyPromptBuilder:
         else:
             atmosphere = "观众气氛中性，重点根据当前弹幕内容接话。"
 
-        if hot_topics:
-            topic_text = "、".join(str(item.get("topic", "")) for item in hot_topics[:3] if isinstance(item, dict))
-            topic_hint = f"当前热话题：{topic_text}。能自然接上时可以顺手提，但不要强行复读。"
-        else:
-            topic_hint = "当前没有明显热话题，不要凭空制造设定外事件。"
-
         if replied_danmaku:
             repeat_hint = "最近已经回复过一些弹幕，避免复用上一条回复的句式、开头和相同表情。"
         else:
@@ -1132,7 +1318,6 @@ class StreamerReplyPromptBuilder:
             f"- 当前弹幕速率：{danmaku_rate} 条/分钟",
             f"- 节奏策略：{rhythm}",
             f"- 气氛策略：{atmosphere}",
-            f"- 话题策略：{topic_hint}",
             f"- 复读控制：{repeat_hint}",
         ])
     
@@ -1223,5 +1408,12 @@ class PersonaDecisionPromptBuilder:
 
 
 persona_qa_selector = PersonaQASelector()
+try:
+    persona_catalog = load_persona_catalog()
+except Exception:
+    # Catalog 快照是新增资产；旧 QA 仍可作为同 hash 的迁移回退，避免
+    # 新资产读取故障直接阻断 Legacy 回复主链。
+    logger.exception("Persona Catalog 静态快照加载失败，回退到 Legacy QA 投影")
+    persona_catalog = build_persona_catalog(persona_qa_selector.qa_items)
 streamer_reply_prompt_builder = StreamerReplyPromptBuilder()
 persona_decision_prompt_builder = PersonaDecisionPromptBuilder()

@@ -15,6 +15,8 @@ from config import settings
 from kangel.shared.logging import logger
 from .pool import DanmakuPool, DanmakuItem, danmaku_pool
 from kangel.persona.application.engine import PersonaEngine, persona_engine
+from kangel.persona.application.prompt_ram import prompt_ram_service
+from kangel.stream.application.metadata import stream_metadata_pusher
 from .load_tracker import resolve_danmaku_load
 from kangel.infrastructure.rate_limiter import concurrency_gate
 from kangel.integrations.ai.service import ai_service
@@ -32,8 +34,9 @@ class SelectionResult:
 class DanmakuSelector:
     """弹幕选择器"""
     
-    def __init__(self, *, clock=None, random_value=None):
+    def __init__(self, *, clock=None, random_value=None, pool: DanmakuPool = danmaku_pool):
         self._lock = asyncio.Lock()
+        self._pool = pool
         self._clock = clock or time.monotonic
         self._random_value = random_value or random.random
         self._last_selection_at: Optional[float] = None
@@ -106,53 +109,56 @@ class DanmakuSelector:
         从可用弹幕中选择最合适的一条
         使用AI结合当前心情状态进行选择
         """
-        if not available_danmaku:
-            return None
-        
-        start_time = datetime.now()
-        scored_danmaku = []
-        
-        try:
-            # 第一步：计算每条弹幕的基础评分
-            scored_danmaku = await self._calculate_base_scores(available_danmaku)
-            
-            # 第二步：使用AI进行智能选择
-            selected = await self._ai_select_danmaku(scored_danmaku)
-            
-            processing_time = (datetime.now() - start_time).total_seconds() * 1000
-            
-            if selected:
-                self._last_selection_at = self._clock()
-                self._last_selection_time = datetime.now()
-                self._selection_count += 1
-                
-                # 标记为已选中
-                selected.status = DanmakuItem.__dataclass_fields__['status'].type.SELECTED
-                
-                return SelectionResult(
-                    selected_danmaku=selected,
-                    selection_reason="AI智能选择",
-                    confidence_score=selected.priority,
-                    processing_time_ms=processing_time
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"弹幕选择过程出错: {e}")
-            processing_time = (datetime.now() - start_time).total_seconds() * 1000
-            
-            # 出错时选择优先级最高的一条
-            if scored_danmaku:
-                best = max(scored_danmaku, key=lambda x: x.priority)
-                return SelectionResult(
-                    selected_danmaku=best,
-                    selection_reason="出错回退：选择最高优先级",
-                    confidence_score=best.priority,
-                    processing_time_ms=processing_time
-                )
-            
-            return None
+        async with self._lock:
+            # 调用方传入的是快照；等待锁期间其他连接可能已选中其中的条目。
+            available_danmaku = [
+                item for item in available_danmaku if item.is_available_for_reply()
+            ]
+            if not available_danmaku:
+                return None
+
+            start_time = datetime.now()
+            scored_danmaku = []
+
+            try:
+                # 第一步：计算每条弹幕的基础评分
+                scored_danmaku = await self._calculate_base_scores(available_danmaku)
+
+                # 第二步：使用AI进行智能选择
+                selected = await self._ai_select_danmaku(scored_danmaku)
+
+                processing_time = (datetime.now() - start_time).total_seconds() * 1000
+
+                if selected and await self._pool.claim_for_reply(selected.id):
+                    self._last_selection_at = self._clock()
+                    self._last_selection_time = datetime.now()
+                    self._selection_count += 1
+
+                    return SelectionResult(
+                        selected_danmaku=selected,
+                        selection_reason="AI智能选择",
+                        confidence_score=selected.priority,
+                        processing_time_ms=processing_time
+                    )
+
+                return None
+
+            except Exception as e:
+                logger.error(f"弹幕选择过程出错: {e}")
+                processing_time = (datetime.now() - start_time).total_seconds() * 1000
+
+                # 出错回退也必须在池锁内成功 claim，不能返回一个陈旧候选。
+                if scored_danmaku:
+                    best = max(scored_danmaku, key=lambda x: x.priority)
+                    if await self._pool.claim_for_reply(best.id):
+                        return SelectionResult(
+                            selected_danmaku=best,
+                            selection_reason="出错回退：选择最高优先级",
+                            confidence_score=best.priority,
+                            processing_time_ms=processing_time
+                        )
+
+                return None
     
     async def _calculate_base_scores(self, danmaku_list: List[DanmakuItem]) -> List[DanmakuItem]:
         """
@@ -160,7 +166,12 @@ class DanmakuSelector:
         基于配置的权重参数
         """
         current_persona = persona_engine.state
-        
+        # P30：并发闸门满时 _ai_select_danmaku 会直接返回本地最高分候选，
+        # 绕过整个提示词。所以「正在等谁回话」必须同时落到本地打分里，
+        # 否则那条兜底路径上等待完全失效。
+        awaiting = self._awaiting_notes()
+        bonus = float(settings.prompt_ram.selector_bonus)
+
         for item in danmaku_list:
             score = 0.0
             
@@ -181,7 +192,9 @@ class DanmakuSelector:
             score += emotional_score * self._weights.get("emotional_match", 0.25)
             
             # 4. 时效性评分 (15%)
-            time_diff = (datetime.now() - item.timestamp).total_seconds()
+            # 秒级新鲜度已经远高于业务需要；截断微秒可避免同批/相邻批评分
+            # 因执行耗时产生不可观测但会破坏稳定排序的浮点抖动。
+            time_diff = int(max(0.0, (datetime.now() - item.timestamp).total_seconds()))
             timeliness_score = max(0, 1 - (time_diff / 300))  # 5分钟内逐渐降低
             score += timeliness_score * self._weights.get("timeliness", 0.15)
             
@@ -191,6 +204,10 @@ class DanmakuSelector:
             
             item.content_score = content_score
             item.emotional_match_score = emotional_score
+            if awaiting and bonus > 0:
+                subject_id = self._item_subject_id(item)
+                if subject_id and subject_id in awaiting:
+                    score = min(1.0, score + bonus)
             item.priority = score
         
         # 按优先级排序
@@ -198,6 +215,26 @@ class DanmakuSelector:
         
         return danmaku_list
     
+    @staticmethod
+    def _awaiting_notes() -> Dict[str, str]:
+        """P30 工作记忆里「正在等谁回话」的 subject_id -> 念头映射。"""
+        try:
+            return prompt_ram_service.build_for_selector(
+                stream_metadata_pusher.get_current_stream_session_id() or ""
+            )
+        except Exception as exc:
+            logger.debug(f"读取工作记忆等待映射失败: {exc}")
+            return {}
+
+    @staticmethod
+    def _item_subject_id(item: DanmakuItem) -> Optional[str]:
+        """按已核验身份匹配候选；昵称字符串永远不参与匹配。"""
+        identity = getattr(item, "viewer_identity", None)
+        subject_id = getattr(identity, "subject_id", None)
+        if isinstance(subject_id, str) and subject_id.strip():
+            return subject_id.strip()
+        return None
+
     def _calculate_content_relevance(self, message: str) -> float:
         """计算内容相关性"""
         # 基于关键词匹配
@@ -275,9 +312,19 @@ class DanmakuSelector:
 
 """
         
+        awaiting = self._awaiting_notes()
+        annotated = False
         for i, item in enumerate(top_candidates, 1):
             prompt += f"{i}. [{item.nickname}] {item.message}\n"
-            prompt += f"   优先级: {item.priority:.3f}, 情感匹配: {item.emotional_match_score:.3f}\n\n"
+            prompt += f"   优先级: {item.priority:.3f}, 情感匹配: {item.emotional_match_score:.3f}\n"
+            note = awaiting.get(self._item_subject_id(item) or "")
+            if note:
+                prompt += f"   ← 你正在等这个人的回话（{note}）\n"
+                annotated = True
+            prompt += "\n"
+
+        if annotated:
+            prompt += "被标注的候选优先，但如果它明显已经离题就不必勉强。\n\n"
         
         prompt += """请从以上弹幕中选择一条进行回复。考虑因素：
 1. 是否符合当前心情状态
@@ -303,7 +350,9 @@ class DanmakuSelector:
             try:
                 response = await ai_service.run(
                     messages=messages,
+                    role="danmaku_selector",
                     model=settings.ai.danmaku_selector_model or settings.ai.default_model,
+                    model_mode="role_hint",
                     temperature=0.3,
                     timeout=settings.ai.danmaku_selector_timeout,
                 )

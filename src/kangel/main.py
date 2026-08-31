@@ -12,19 +12,19 @@ def run() -> None:
     from config import settings
     from kangel.shared.logging import logger
 
-    logger.info("🎯 启动虚拟主播弹幕系统...")
+    logger.info("启动虚拟主播弹幕系统...")
     logger.info(
-        "📡 WebSocket 接口: ws://%s:%s/danmaku",
+        "WebSocket 接口: ws://%s:%s/danmaku",
         settings.server.host,
         settings.server.port,
     )
     logger.info(
-        "🌐 HTTP 接口: http://%s:%s/",
+        "HTTP 接口: http://%s:%s/",
         settings.server.host,
         settings.server.port,
     )
     logger.info(
-        "📊 状态接口: http://%s:%s/status",
+        "状态接口: http://%s:%s/status",
         settings.server.host,
         settings.server.port,
     )

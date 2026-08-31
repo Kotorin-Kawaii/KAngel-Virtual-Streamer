@@ -10,3 +10,7 @@ from .resource_schemas import (
     SCConfigResponse, SCSubmitRequest, SCSubmitResponse, SCStatusResponse,
 )
 from .resource_schemas import EmoteConfigResponse, DanmakuBroadcast, DanmakuResponse
+from .resource_schemas import (
+    SponsorConfigResponse, SponsorEntry, SponsorListResponse,
+    SponsorSyncStatsResponse,
+)

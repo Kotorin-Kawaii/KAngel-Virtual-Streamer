@@ -18,3 +18,19 @@ def __getattr__(name: str):
         from importlib import import_module
         return getattr(import_module(f"{__name__}.{module_name}"), name)
     raise AttributeError(name)
+"""Danmaku application services public entry points."""
+
+_MODULES = {
+    "LanguageDetection": "language",
+    "LanguageDetector": "language",
+    "ReplyLanguagePolicy": "language",
+    "EnglishSurpriseJokeService": "language",
+}
+__all__ = list(_MODULES)
+
+
+def __getattr__(name: str):
+    if module_name := _MODULES.get(name):
+        from importlib import import_module
+        return getattr(import_module(f"{__name__}.{module_name}"), name)
+    raise AttributeError(name)

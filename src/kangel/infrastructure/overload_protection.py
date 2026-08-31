@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 import os
-import resource
 
 from config import settings
 from .security_metrics import security_metrics
@@ -18,9 +17,19 @@ class OverloadDecision:
 class OverloadProtector:
     @staticmethod
     def _rss_mb() -> float:
-        value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # macOS 为 bytes，Linux 为 KiB。
-        return value / (1024 * 1024) if value > 10_000_000 else value / 1024
+        # 优先使用 psutil 获取 RSS，保证全平台兼容（Windows 没有 resource 模块）。
+        try:
+            import psutil
+
+            rss_bytes = psutil.Process(os.getpid()).memory_info().rss
+            return rss_bytes / (1024 * 1024)
+        except ImportError:
+            # Unix 兜底：psutil 不可用时回退到 resource（仅类 Unix 可用）。
+            import resource
+
+            value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # macOS 为 bytes，Linux 为 KiB。
+            return value / (1024 * 1024) if value > 10_000_000 else value / 1024
 
     def snapshot(self, *, connections: int, ai_active: int, ai_waiting: int) -> dict:
         try:

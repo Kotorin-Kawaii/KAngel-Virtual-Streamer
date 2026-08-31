@@ -14,11 +14,12 @@ from fastapi import (
     APIRouter, Depends, FastAPI, WebSocket, WebSocketDisconnect, HTTPException,
     Query, Request, Response,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from .schemas import DanmakuResponse, DanmakuBroadcast
+from .admin_ui import ADMIN_UI_HTML
 from .api_schemas import ServerStatus, RootResponse, ConfigResponse, ConfigUpdateRequest
 from .auth_schemas import (
-    RegisterRequest, LoginRequest, AuthTokenResponse, AccountResponse,
+    RegisterRequest, LoginRequest, AuthTokenResponse, AuthRefreshResponse, AccountResponse,
     NicknameUpdateRequest, NicknameHistoryResponse,
     RateLimitErrorResponse,
 )
@@ -30,6 +31,9 @@ from .schemas import (
     SCConfigResponse, SCSubmitRequest, SCSubmitResponse, SCStatusResponse,
 )
 from .schemas import EmoteConfigResponse
+from .schemas import (
+    SponsorConfigResponse, SponsorListResponse, SponsorSyncStatsResponse,
+)
 from kangel.transport.websocket.connection_manager import connection_manager
 from kangel.persona.application.engine import persona_engine
 from kangel.infrastructure.event_bus import event_bus
@@ -37,16 +41,25 @@ from kangel.danmaku.application.pool import danmaku_pool
 from kangel.danmaku.application.selector import danmaku_selector
 from kangel.stream.application.mood_pusher import mood_pusher
 from kangel.stream.application.metadata import stream_metadata_pusher
+from kangel.stream.application.session_summary import stream_session_summary_consumer
+from kangel.memory.application.episodic import episodic_memory_consumer, episodic_memory_manager
 from kangel.persona.application.impact_analyzer import persona_impact_analyzer
 from kangel.persona.application.runtime import persona_dynamics, persona_event_pipeline
 from kangel.infrastructure.database import db_manager
+from kangel.infrastructure.reply_timing import reply_timing_metrics
+from kangel.infrastructure.prompt_budget import prompt_budget_metrics
+from kangel.integrations.ai.persona import persona_prompt_metrics
 from kangel.danmaku.application.memory import danmaku_memory_manager
+from kangel.danmaku.application.language import english_surprise_joke_service
 from kangel.persona.application.emotion_manager import emotion_manager
+from kangel.persona.application.intent_shadow import intent_candidate_shadow_service
+from kangel.persona.application.prompt_ram import prompt_ram_service
 from kangel.audience.application.relationship_service import audience_relationship_manager
 from kangel.audience.application.presence_service import viewer_presence_coordinator
 from kangel.persona.domain.events import DanmakuReceivedEvent, StreamLifecycleEvent
 from kangel.infrastructure.auth import (
     auth_service, UsernameAlreadyExistsError, InvalidCredentialsError,
+    InvalidRefreshTokenError,
 )
 from kangel.infrastructure.bounded_work_gate import ai_reply_work_gate
 from kangel.memory.application.governance import account_memory_governance_service
@@ -56,7 +69,18 @@ from kangel.integrations.superchat.service import (
     sc_service,
 )
 from kangel.integrations.superchat.consumer import sc_consumer
+from kangel.integrations.sponsor.service import sponsor_service
+from kangel.integrations.sponsor.sync_worker import sponsor_sync_worker
+from kangel.integrations.ai import token_report
+from kangel.integrations.ai.service import ai_service
+from kangel.integrations.ai.schemas import (
+    TokenDailyResponse, TokenBreakdownResponse, TokenRecordsResponse,
+    TokenAuditStatsResponse,
+)
+from kangel.integrations.ai.token_audit import token_audit_recorder
 from kangel.audience.application.emote_service import viewer_emote_service
+from kangel.moderation.application.service import moderation_service
+from kangel.moderation.application.coordinator import moderation_coordinator
 from kangel.infrastructure.security_metrics import security_metrics
 from kangel.infrastructure.overload_protection import overload_protector
 from kangel.infrastructure.rate_limiter import (
@@ -173,6 +197,9 @@ async def _cleanup_websocket_connection(websocket: WebSocket) -> None:
         )
 
     await audience_relationship_manager.forget_guest(identity)
+    if identity and not identity.is_authenticated:
+        await asyncio.to_thread(moderation_service.forget_guest, identity.subject_id)
+    english_surprise_joke_service.forget_guest(identity)
     await event_bus.emit("client_disconnected", websocket)
     stream_metadata_pusher.update_viewer_count(connection_manager.get_connection_count())
     logger.info(f"客户端断开连接，当前连接数: {connection_manager.get_connection_count()}")
@@ -200,6 +227,30 @@ async def _send_ws_limit_event(
             "scope": decision.scope,
             "action": decision.action,
             "request_id": str(uuid.uuid4()),
+        },
+    })
+
+
+async def _send_moderation_status(
+    websocket: WebSocket, *, action: str, status: dict[str, Any],
+    moderation_id: str | None = None,
+) -> None:
+    """只向当前连接发送安全裁剪后的主播管理状态。"""
+    message = {
+        "muted": "你暂时不能发送弹幕，请稍后再回来聊天。",
+        "pending": "主播正在处理上一条互动，请稍后再发言。",
+    }.get(action, "直播间管理状态已更新。")
+    await connection_manager.send_json_to(websocket, {
+        "type": WebSocketEventType.STREAMER_MODERATION,
+        "data": {
+            "action": action,
+            "scope": "self",
+            "muted": bool(status.get("muted")),
+            "mute_until": status.get("mute_until"),
+            "retry_after_seconds": int(status.get("retry_after_seconds", 0)),
+            "message": message,
+            "moderation_id": moderation_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     })
 
@@ -511,6 +562,39 @@ async def login_account(payload: LoginRequest, response: Response, request: Requ
         lease.release()
 
 
+@router.post(
+    "/auth/refresh",
+    response_model=AuthRefreshResponse,
+    responses={401: {"description": "refresh Cookie 无效、已过期或已被使用"}},
+)
+async def refresh_auth_session(response: Response, request: Request):
+    """仅用 HttpOnly refresh Cookie 轮换浏览器会话，不返回任何令牌。"""
+    refresh_token = request.cookies.get(settings.auth.refresh_cookie_name, "")
+    try:
+        result = await asyncio.to_thread(auth_service.refresh, refresh_token)
+    except InvalidRefreshTokenError as exc:
+        raise HTTPException(status_code=401, detail="登录状态已过期，请重新登录") from exc
+    _set_auth_cookie(response, result)
+    return {"account": result["account"], "expires_at": result["expires_at"]}
+
+
+@router.get(
+    "/auth/profile",
+    response_model=AccountResponse,
+    responses={401: {"description": "访问令牌无效或已过期"}},
+)
+async def get_account_profile(request: Request):
+    """读取 Cookie 或 Bearer 令牌对应的当前账号，用于浏览器恢复登录态。"""
+    principal = await _require_http_principal(request)
+    limited = _enforce_profile_rate_limit(principal.account_id, write=False)
+    if limited:
+        return limited
+    account = await asyncio.to_thread(auth_service.get_account, principal.account_id)
+    if not account:
+        raise HTTPException(status_code=401, detail="访问令牌无效或已过期")
+    return account
+
+
 @router.patch(
     "/auth/profile/nickname",
     response_model=AccountResponse,
@@ -681,9 +765,26 @@ async def submit_sc(payload: SCSubmitRequest, request: Request):
     if not decision.allowed:
         raise RateLimitExceeded("sc_submit_rate", decision.retry_after_seconds)
     try:
-        return await asyncio.to_thread(
+        accepted = await asyncio.to_thread(
             sc_service.submit, principal, payload.sc_id, payload.content
         )
+        # 只有首次成功接受会返回 accepted；幂等重放在上方提前返回，且
+        # service 的并发重放返回 pending，因此不会重复写公共历史。
+        if accepted.get("status") == "accepted":
+            sc_message = DanmakuResponse(
+                nickname=accepted["nickname"],
+                message=accepted["content"],
+                type="sc",
+                timestamp=accepted["accepted_at"],
+                danmakuID=accepted["sc_id"],
+            )
+            try:
+                await connection_manager.broadcast_message(sc_message)
+            except Exception:
+                # SC 已经持久化接受，展示广播异常不能把成功响应伪装成失败，
+                # 否则客户端重试会产生错误的业务认知。
+                logger.exception("SC 已接受但公共展示广播失败 [%s]", accepted["sc_id"])
+        return accepted
     except SCCooldownError as exc:
         request_id = str(uuid.uuid4())
         return JSONResponse(
@@ -744,6 +845,39 @@ async def get_emote_config():
     }
 
 
+@router.get("/sponsor/config", response_model=SponsorConfigResponse)
+async def get_sponsor_config():
+    """页面底部赞助入口的展示元数据。
+
+    赞助完全自愿，不授予任何功能权益。响应只含展示文案与外链，
+    绝不包含爱发电 user_id 或 token。
+    """
+    return sponsor_service.public_config()
+
+
+@router.get("/sponsors", response_model=SponsorListResponse)
+async def list_sponsors():
+    """赞助者感谢墙：仅昵称，无排序，无金额。
+
+    未开启或未开启名单同步时返回 enabled=false 与空列表。
+    """
+    if not settings.sponsor.list_enabled:
+        return {
+            "enabled": False, "total_count": 0, "updated_at": None, "sponsors": [],
+        }
+    return await asyncio.to_thread(sponsor_service.list_public)
+
+
+@router.get(
+    "/admin/sponsor/stats",
+    response_model=SponsorSyncStatsResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def get_sponsor_sync_stats():
+    """赞助名单同步健康度；不返回凭据，也不返回单人金额。"""
+    return await asyncio.to_thread(sponsor_service.get_stats)
+
+
 @router.get(
     "/sc/{sc_id}",
     response_model=SCStatusResponse,
@@ -786,14 +920,45 @@ async def get_sc_stats():
     return await asyncio.to_thread(sc_service.get_stats)
 
 
+@router.get("/moderation/status")
+async def get_moderation_status(request: Request):
+    """登录用户恢复自己的本站主播管理状态；不公开评分与内部理由。"""
+    principal = await _require_http_principal(request)
+    limited = _enforce_profile_rate_limit(principal.account_id, write=False)
+    if limited:
+        return limited
+    subject_key = f"account:{principal.account_id}"
+    return await asyncio.to_thread(moderation_service.status, subject_key)
+
+
+@router.get("/admin/moderation/stats", dependencies=ADMIN_ONLY)
+async def get_moderation_stats():
+    return await asyncio.to_thread(moderation_service.get_stats)
+
+
 @router.get("/admin/emotes/stats", dependencies=ADMIN_ONLY)
 async def get_emote_stats():
     return viewer_emote_service.get_metrics()
 
 
+@router.get("/admin/prompt-ram", dependencies=ADMIN_ONLY)
+async def get_prompt_ram():
+    """P30 主播工作记忆快照。
+
+    ``note`` 是模型自由生成的念头原文、``target_subject_id`` 是身份主键，
+    两者只允许出现在这个 ADMIN_ONLY 接口里：想法既不进 WS 广播也不进数据库，
+    观众看不到自己的注入是否奏效，也就无法迭代攻击。
+    """
+    return {
+        "enabled": settings.prompt_ram.enabled,
+        "stats": prompt_ram_service.get_stats(),
+        "entries": prompt_ram_service.snapshot(),
+    }
+
+
 @router.get("/admin/security/stats", dependencies=ADMIN_ONLY)
 async def get_security_stats():
-    """固定低基数安全指标；不含 IP、账号、昵称、令牌或事件 ID。"""
+    """受控的低基数运行指标；不含 IP、账号、昵称、令牌或事件 ID。"""
     gate = ai_reply_work_gate.snapshot()
     pressure = overload_protector.snapshot(
         connections=connection_manager.get_connection_count(),
@@ -803,7 +968,146 @@ async def get_security_stats():
         **security_metrics.snapshot(),
         "pressure": pressure,
         "ai_reply_gate": gate,
+        "reply_timing": reply_timing_metrics.snapshot(),
+        "prompt_budget": prompt_budget_metrics.snapshot(),
+        "persona_prompt": persona_prompt_metrics.snapshot(),
+        "intent_shadow": intent_candidate_shadow_service.snapshot(),
+        "stream_metadata": stream_metadata_pusher.get_stats(),
+        "persona_feature_flags": {
+            "reply_plan_injection_enabled": settings.persona.reply_plan_injection_enabled,
+            "persona_prompt_mode": settings.persona.prompt_mode,
+            "persona_prompt_rollout_percent": settings.persona.prompt_rollout_percent,
+            "event_appraisal_enabled": settings.ai.event_appraisal_enabled,
+            "streamer_beat_enabled": settings.stream.beat_enabled,
+        },
+        "reply_language": english_surprise_joke_service.get_stats(),
+        "moderation": moderation_service.get_stats(),
+        "episodic_memory": {
+            **episodic_memory_manager.get_stats(),
+            "consumer": episodic_memory_consumer.get_stats(),
+        },
     }
+
+
+# ==================== Token 审计与管理后台（P29） ====================
+
+
+@router.get(
+    "/admin/tokens/daily",
+    response_model=TokenDailyResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def get_token_daily(days: int = Query(default=14, ge=1, le=180)):
+    """每天一行的 token 用量与折算花费；缺数据的日子补零。"""
+    return await asyncio.to_thread(token_report.daily_report, days)
+
+
+@router.get(
+    "/admin/tokens/breakdown",
+    response_model=TokenBreakdownResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def get_token_breakdown(
+    start: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    end: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    days: int = Query(default=14, ge=1, le=180),
+):
+    """一次返回 role / provider / model 三种分组，省掉三次后台请求。"""
+    return await asyncio.to_thread(
+        token_report.breakdown_report, start, end, days
+    )
+
+
+@router.get(
+    "/admin/tokens/records",
+    response_model=TokenRecordsResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def get_token_records(
+    day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    role: str | None = Query(default=None, max_length=64),
+    status: str | None = Query(default=None, pattern="^(success|failed)$"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """逐次调用明细；只有元数据与计数，没有正文、账号或 IP。"""
+    return await asyncio.to_thread(
+        lambda: token_report.records_report(
+            day=day, role=role, status=status, limit=limit, offset=offset
+        )
+    )
+
+
+@router.get(
+    "/admin/tokens/stats",
+    response_model=TokenAuditStatsResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def get_token_audit_stats():
+    """记账器健康度 + 价目覆盖：哪些模型有量却没配价。"""
+    return await asyncio.to_thread(token_report.audit_stats)
+
+
+@router.get("/admin/overview", dependencies=ADMIN_ONLY)
+async def get_admin_overview():
+    """一次性只读快照。
+
+    后台开屏必须只发一个请求：admin 桶默认 burst=10、concurrency=2，
+    逐个拉 40 个接口第 11 个就会 429。
+    """
+    gate = ai_reply_work_gate.snapshot()
+    sc_stats, moderation_stats, sponsor_stats, database_stats, tokens = (
+        await asyncio.gather(
+            asyncio.to_thread(sc_service.get_stats),
+            asyncio.to_thread(moderation_service.get_stats),
+            asyncio.to_thread(sponsor_service.get_stats),
+            asyncio.to_thread(db_manager.get_stats),
+            asyncio.to_thread(token_report.daily_report, 7),
+        )
+    )
+    return {
+        "server": {
+            "status": "running",
+            "active_connections": connection_manager.get_connection_count(),
+            "message_history_count": connection_manager.get_history_count(),
+            "server_time": datetime.now().isoformat(),
+        },
+        "danmaku_pool": danmaku_pool.get_pool_stats(),
+        "mood_pusher": mood_pusher.get_stats(),
+        "ai_reply_gate": gate,
+        "sc": sc_stats,
+        "moderation": moderation_stats,
+        "emotes": viewer_emote_service.get_metrics(),
+        "sponsor": sponsor_stats,
+        "database": database_stats,
+        "tokens": tokens,
+        "plugins": plugin_manager.list_plugins(),
+    }
+
+
+@router.get("/admin/ui", include_in_schema=False)
+async def get_admin_ui():
+    """管理后台单页；只受 admin.enabled 门禁，数据请求才校验密钥。
+
+    页面外壳不校验密钥：它不含任何数据或凭据，而要求密钥就得把密钥放进 URL
+    （会进访问日志与浏览器历史）。密钥由页面顶部输入并只存 sessionStorage。
+    """
+    if not settings.admin.enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return HTMLResponse(
+        content=ADMIN_UI_HTML,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            # 单文件内联脚本需要 'unsafe-inline'；页面不吃任何外部输入、零外部请求。
+            "Content-Security-Policy": (
+                "default-src 'none'; connect-src 'self'; "
+                "style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                "img-src data:; form-action 'none'; frame-ancestors 'none'"
+            ),
+        },
+    )
 
 
 # 弹幕频率计数器
@@ -815,7 +1119,11 @@ _danmaku_rate_counter = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    logger.info("🚀 弹幕服务器启动中...")
+    logger.info("弹幕服务器启动中...")
+    logger.info(
+        "AI 角色运行诊断（无密钥）: %s",
+        json.dumps(ai_service.runtime_diagnostics(), ensure_ascii=False),
+    )
     
     config_manager.update_settings(settings)
     await plugin_manager.load_plugins()
@@ -826,20 +1134,29 @@ async def lifespan(app: FastAPI):
     await mood_pusher.start()  # 启动心情推送服务
     await stream_metadata_pusher.start()  # 启动直播间元信息推送服务
     await sc_consumer.start()
+    await stream_session_summary_consumer.start()
+    await episodic_memory_consumer.start()
+    await sponsor_sync_worker.start()  # P25 赞助名单同步（纯旁路，默认关闭）
+    await token_audit_recorder.start()  # P29 token 记账落库（失败只影响审计自身）
     await event_bus.emit("server_startup")
-    
+
     yield
-    
+
     await persona_event_pipeline.publish(
         StreamLifecycleEvent(phase="ended", source="fastapi_lifespan")
     )
+    await sponsor_sync_worker.stop()
+    await token_audit_recorder.stop()  # 关服前把队列写完，避免最后几次调用的账丢掉
+    await stream_session_summary_consumer.stop()
+    await episodic_memory_consumer.stop()
+    await moderation_coordinator.stop()
     await sc_consumer.stop()
     await persona_event_pipeline.stop()
     await mood_pusher.stop()  # 停止心情推送服务
     await stream_metadata_pusher.stop()  # 停止直播间元信息推送服务
     await viewer_presence_coordinator.clear()
     await event_bus.emit("server_shutdown")
-    logger.info("🛑 弹幕服务器关闭")
+    logger.info("弹幕服务器关闭")
 
 
 @router.get("/", response_model=RootResponse)
@@ -1071,25 +1388,22 @@ async def export_danmaku_data(start_time: str = None, end_time: str = None):
 @router.get("/memory/stats", dependencies=ADMIN_ONLY)
 async def get_memory_stats():
     """获取弹幕记忆统计信息"""
-    return danmaku_memory_manager.get_stats()
+    return await danmaku_memory_manager.get_stats()
+
+
+@router.get("/memory/episodic/stats", dependencies=ADMIN_ONLY)
+async def get_episodic_memory_stats():
+    """获取 P24 低基数任务/候选/记忆状态，不返回账号或原文。"""
+    return {
+        **episodic_memory_manager.get_stats(),
+        "consumer": episodic_memory_consumer.get_stats(),
+    }
 
 
 @router.get("/memory/context", dependencies=ADMIN_ONLY)
 async def get_memory_context(limit: int = Query(10, ge=1, le=100)):
     """获取弹幕记忆上下文"""
     return await danmaku_memory_manager.get_memory_context(limit=limit)
-
-
-@router.get("/memory/hot-topics", dependencies=ADMIN_ONLY)
-async def get_hot_topics(limit: int = Query(5, ge=1, le=100)):
-    """获取热门话题"""
-    hot_topics = await danmaku_memory_manager.get_hot_topics(limit=limit)
-    return {
-        "hot_topics": [
-            {"topic": topic, "heat": heat}
-            for topic, heat in hot_topics
-        ]
-    }
 
 
 @router.get("/memory/group-discussion", dependencies=ADMIN_ONLY)
@@ -1202,9 +1516,13 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
     resolved_token = _websocket_access_token(websocket, access_token)
     if resolved_token:
         verified_principal = auth_service.authenticate_access_token(resolved_token)
+        # 无效/过期令牌降级为匿名连接，而非 close 拒绝。
+        # close 在 accept 之前调用会导致 Uvicorn 返回 HTTP 403，
+        # 浏览器持有旧 Cookie 时会持续触发此错误。
         if verified_principal is None:
-            await websocket.close(code=1008, reason="无效或已过期的访问令牌")
-            return
+            logger.warning("WebSocket 令牌无效，降级为匿名连接 ip=%s", client_ip)
+            resolved_token = None
+            verified_principal = None
     account_id = verified_principal.account_id if verified_principal else ""
     gate = ai_reply_work_gate.snapshot()
     pressure = overload_protector.snapshot(
@@ -1376,6 +1694,18 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                         "message": "该 danmakuID 已处理，请勿重复提交",
                     }, ensure_ascii=False))
                     continue
+
+                moderation_subject, _, _ = moderation_service.subject_key(
+                    viewer_identity, connection.id if connection else "unknown"
+                )
+                moderation_status = await asyncio.to_thread(
+                    moderation_service.is_blocked, moderation_subject
+                )
+                if moderation_status.get("muted"):
+                    await _send_moderation_status(
+                        websocket, action="muted", status=moderation_status
+                    )
+                    continue
                 
                 # 更新弹幕频率
                 current_rate = _update_danmaku_rate()
@@ -1391,7 +1721,8 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                 )
                 
                 # 记录弹幕到数据库
-                db_manager.record_danmaku(
+                await asyncio.to_thread(
+                    db_manager.record_danmaku,
                     danmaku_id=message_data["danmakuID"],
                     nickname=message_data["nickname"],
                     message=message_data["message"],
@@ -1433,7 +1764,7 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                         platform_message_id=message_data["danmakuID"],
                     )
                 )
-                
+
                 plugin_results = await plugin_manager.emit_event("danmaku_received", message_data)
                 if plugin_results:
                     message_data = plugin_results[-1]
@@ -1463,6 +1794,50 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                     "danmaku_rate": current_rate
                 }
                 await websocket.send_text(json.dumps(confirmation, ensure_ascii=False))
+
+                # 主播管理分析是旁路异步任务：原始弹幕已正常进入直播间，
+                # moderation 结果只负责后续主播设界和禁言，不阻塞当前广播。
+                moderation_direct_context = None
+                try:
+                    moderation_long_term = persona_engine._retrieve_long_term_context(
+                        viewer_identity, message_data["message"]
+                    )
+                    moderation_replied = await danmaku_pool.get_replied_danmaku(limit=5)
+                    moderation_direct_context = persona_engine._build_direct_conversation_context(
+                        long_term_context=moderation_long_term,
+                        replied_danmaku=moderation_replied,
+                        identity=viewer_identity,
+                        current_message=message_data["message"],
+                        nickname=message_data["nickname"],
+                    )
+                except Exception as moderation_context_error:
+                    logger.debug("构建主播管理上下文失败，降级为空上下文: %s", moderation_context_error)
+                stream_snapshot = stream_metadata_pusher.get_metadata().to_dict()
+                moderation_coordinator.schedule(
+                    danmaku_id=message_data["danmakuID"],
+                    message=message_data["message"],
+                    nickname=message_data["nickname"],
+                    identity=viewer_identity,
+                    connection_id=connection.id if connection else "unknown",
+                    websocket=websocket,
+                    context={
+                        "viewer_relationship": viewer_relationship.model_dump(),
+                        "direct_context": moderation_direct_context or {},
+                        "stream_session_id": stream_metadata_pusher.get_current_stream_session_id(),
+                        "stream_context": {
+                            "is_live": stream_snapshot.get("is_live"),
+                            "daily_theme_id": stream_snapshot.get("daily_theme_id"),
+                            "daily_theme_name": stream_snapshot.get("daily_theme_name"),
+                            "special_date_theme": stream_snapshot.get("special_date_theme"),
+                            "current_activity": stream_snapshot.get("current_activity"),
+                            "viewer_count": stream_snapshot.get("viewer_count"),
+                            "danmaku_rate": current_rate,
+                            "audience_sentiment": persona_event_pipeline.audience_sentiment,
+                        },
+                        "persona_state": persona_engine.state.model_dump(),
+                        "internal_state": persona_engine.internal_state.model_dump(),
+                    },
+                )
                 
                 # 弹幕选择逻辑
                 # 先获取可用的弹幕
@@ -1543,6 +1918,7 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                         "message": selected.message,
                                         "danmakuID": selected.id,
                                         "_viewer_identity": selected.viewer_identity,
+                                        "_stream_session_id": stream_metadata_pusher.get_current_stream_session_id(),
                                     })
                                 finally:
                                     await reply_lease.release()
@@ -1561,11 +1937,14 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                     # 记录回复到数据库
                                     try:
                                         # 获取弹幕记录ID
-                                        danmaku_record = db_manager.get_danmaku_by_id(selected.id)
+                                        danmaku_record = await asyncio.to_thread(
+                                            db_manager.get_danmaku_by_id, selected.id
+                                        )
                                         danmaku_record_id = danmaku_record['id'] if danmaku_record else None
                                         
                                         # 记录回复
-                                        db_manager.record_reply(
+                                        await asyncio.to_thread(
+                                            db_manager.record_reply,
                                             danmaku_id=selected.id,
                                             danmaku_nickname=selected.nickname,
                                             danmaku_message=selected.message,
@@ -1582,9 +1961,12 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                             emotional_tone=analysis.emotional_tone if analysis else None,
                                             content_intensity=analysis.content_intensity if analysis else None,
                                             context_relevance=analysis.context_relevance if analysis else None,
-                                            analysis_reasoning=analysis.reasoning if analysis else None,
+                                            # P22：不把模型自由 reasoning 写入生产数据库。
+                                            analysis_reasoning=None,
                                             key_factors=analysis.key_factors if analysis else None,
-                                            danmaku_record_id=danmaku_record_id
+                                            danmaku_record_id=danmaku_record_id,
+                                            stream_session_id=stream_metadata_pusher.get_current_stream_session_id(),
+                                            source_type="normal",
                                         )
                                         logger.debug(f"回复已记录到数据库")
                                     except Exception as db_error:
@@ -1603,7 +1985,15 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                     }
                                     
                                     # 广播给所有连接的客户端
-                                    await connection_manager.broadcast_json(reply_broadcast)
+                                    broadcast_started_at = time.perf_counter()
+                                    try:
+                                        await connection_manager.broadcast_json(reply_broadcast)
+                                    finally:
+                                        reply_timing_metrics.record(
+                                            "broadcast",
+                                            (time.perf_counter() - broadcast_started_at) * 1000,
+                                            path="normal",
+                                        )
                                     logger.info("AI回复已广播给所有客户端")
                                 else:
                                     logger.warning("AI回复生成失败，结果为空")
