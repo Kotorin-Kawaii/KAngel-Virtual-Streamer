@@ -22,15 +22,20 @@ logger = logging.getLogger(__name__)
 class TokenAuditRecorder:
     """收集每次模型调用的 token 用量，按批写入 SQLite。"""
 
-    def __init__(self, database=None, clock=None):
+    def __init__(self, database=None, clock=None, monotonic=None):
         self.database = database or db_manager
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        # 清理节流用单调钟；留一个注入口，否则测试的结果会取决于机器开机时长
+        # （time.monotonic() 小于 purge_interval_seconds 时首次清理会被判为"太近"）。
+        self.monotonic = monotonic or time.monotonic
         self._queue: Deque[Dict[str, Any]] = deque(
             maxlen=settings.token_audit.queue_capacity
         )
         self._task: Optional[asyncio.Task] = None
         self._running = False
-        self._last_purge_at = 0.0
+        # None = 本进程还没清理过；用它而不是 0.0，这样首次清理不会因为
+        # 单调钟起点太小（刚开机）而被节流白等一个周期。
+        self._last_purge_at: Optional[float] = None
         self._stats: Dict[str, Any] = {
             "recorded": 0, "flushed": 0, "dropped": 0, "errors": 0,
             "purged": 0, "retries": 0,
@@ -167,8 +172,11 @@ class TokenAuditRecorder:
 
     async def _maybe_purge(self) -> None:
         """机会式清理过期明细；每日聚合永久保留。"""
-        now = time.monotonic()
-        if now - self._last_purge_at < settings.token_audit.purge_interval_seconds:
+        now = self.monotonic()
+        if (
+            self._last_purge_at is not None
+            and now - self._last_purge_at < settings.token_audit.purge_interval_seconds
+        ):
             return
         self._last_purge_at = now
         cutoff = (

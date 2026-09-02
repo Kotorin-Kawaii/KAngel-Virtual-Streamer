@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, Optional
 
 from kangel.persona.application.engine import persona_engine
 from kangel.shared.logging import logger
 from config import settings
 from kangel.infrastructure.bounded_work_gate import ai_reply_work_gate
+from kangel.infrastructure.reply_timing import reply_timing_metrics
 from kangel.transport.websocket.connection_manager import connection_manager
 from kangel.transport.websocket.protocol import WebSocketEventType
 
@@ -48,11 +50,20 @@ class ModerationCoordinator:
         self, *, danmaku_id: str, message: str, nickname: str,
         identity, connection_id: str, websocket, context: dict[str, Any],
     ) -> None:
+        # 旁路分析不在回复关键路径上（schedule 用 create_task），但 §6 要求能看到
+        # 它的真实开销，所以单独记一条 moderation 序列，不混进回复链的分位数。
+        analysis_started = perf_counter()
         try:
-            decision = await self.service.analyze_and_decide(
-                danmaku_id=danmaku_id, message=message, nickname=nickname,
-                identity=identity, connection_id=connection_id, context=context,
-            )
+            try:
+                decision = await self.service.analyze_and_decide(
+                    danmaku_id=danmaku_id, message=message, nickname=nickname,
+                    identity=identity, connection_id=connection_id, context=context,
+                )
+            finally:
+                reply_timing_metrics.record(
+                    "moderation", (perf_counter() - analysis_started) * 1000,
+                    path="normal", model_role="moderation",
+                )
             if not decision or decision.action == "none":
                 return
 

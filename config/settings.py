@@ -13,7 +13,10 @@ class ServerConfig(BaseSettings):
 
 
 class ProviderModelMapping(BaseModel):
-    """供应商支持的各角色模型名；未配的角色回退到 default。"""
+    """供应商支持的各角色模型名；未配的普通角色回退到 default。
+
+    ``viewer_impression`` 是隐私敏感的独立旁路，必须显式配置，不参与该回退。
+    """
     default: str = ""
     qa_selector: Optional[str] = None
     danmaku_selector: Optional[str] = None
@@ -22,6 +25,7 @@ class ProviderModelMapping(BaseModel):
     moderation: Optional[str] = None
     session_memory: Optional[str] = None
     stream_director: Optional[str] = None
+    viewer_impression: Optional[str] = None
 
 
 class ProviderReasoningMapping(BaseModel):
@@ -34,6 +38,7 @@ class ProviderReasoningMapping(BaseModel):
     moderation: Optional[Literal["off", "low", "medium", "high"]] = None
     session_memory: Optional[Literal["off", "low", "medium", "high"]] = None
     stream_director: Optional[Literal["off", "low", "medium", "high"]] = None
+    viewer_impression: Optional[Literal["off", "low", "medium", "high"]] = None
 
 
 class AIProvider(BaseModel):
@@ -117,6 +122,10 @@ class AIConfig(BaseSettings):
     session_memory_timeout: int = Field(default=60, ge=5, le=300, description="下播情景记忆总结超时时间(秒)")
     stream_director_model: Optional[str] = Field(default=None, description="可选直播导演模型，留空时使用默认模型")
     stream_director_timeout: int = Field(default=12, ge=3, le=60)
+    viewer_impression_model: Optional[str] = Field(
+        default=None, description="Viewer Impression 专用模型；留空表示该功能不可用"
+    )
+    viewer_impression_timeout: int = Field(default=300, ge=5, le=900)
 
     # —— 多供应商配置 ——
     providers: list[AIProvider] = Field(
@@ -494,6 +503,7 @@ class CORSConfig(BaseSettings):
     """浏览器跨域访问白名单；启用凭据时禁止使用通配来源。"""
     allowed_origins: list[str] = Field(default_factory=lambda: [
         "https://kotorin-kawaii.github.io",
+        "https://kangel.kotorin.cn",
         "http://localhost:5173",
         "http://localhost:3000",
     ])
@@ -535,6 +545,26 @@ class MemoryConfig(BaseSettings):
     prompt_summary_limit: int = Field(default=1, ge=0, le=5)
     prompt_fragment_chars: int = Field(default=160, ge=50, le=500)
     prompt_summary_chars: int = Field(default=240, ge=50, le=1000)
+
+
+class ViewerImpressionConfig(BaseSettings):
+    """注册用户的低频长期印象留言；独立于实时回复链。"""
+
+    enabled: bool = False
+    cooldown_days: int = Field(default=7, ge=1, le=365)
+    min_conversation_fragments: int = Field(default=3, ge=0, le=100)
+    min_topic_memories: int = Field(default=1, ge=0, le=100)
+    max_fragment_evidence: int = Field(default=12, ge=0, le=100)
+    max_topic_evidence: int = Field(default=8, ge=0, le=100)
+    max_episodic_evidence: int = Field(default=5, ge=0, le=100)
+    max_prompt_chars: int = Field(default=12000, ge=1000, le=50000)
+    max_output_chars: int = Field(default=1800, ge=100, le=10000)
+    worker_concurrency: int = Field(default=1, ge=1, le=4)
+    max_pending_tasks: int = Field(default=100, ge=1, le=10000)
+    max_attempts: int = Field(default=3, ge=1, le=8)
+    processing_lease_seconds: int = Field(default=600, ge=30, le=3600)
+    retry_backoff_seconds: int = Field(default=600, ge=0, le=86400)
+    retry_backoff_max_seconds: int = Field(default=3600, ge=1, le=604800)
 
 
 class EpisodicMemoryConfig(BaseSettings):
@@ -644,6 +674,12 @@ class SponsorConfig(BaseSettings):
     sync_max_pages: int = Field(default=20, ge=1, le=200)
     sync_backoff_seconds: int = Field(default=60, ge=10, le=3600)
     sync_max_backoff_seconds: int = Field(default=3600, ge=60, le=86400)
+    # Sponsor Fund Transparency：与感谢墙完全隔离，默认关闭。
+    transparency_enabled: bool = False
+    finance_sync_enabled: bool = False
+    finance_sync_interval_seconds: int = Field(default=3600, ge=300, le=86400)
+    finance_sync_max_pages: int = Field(default=20, ge=1, le=200)
+    transparency_cache_seconds: int = Field(default=60, ge=0, le=3600)
     list_limit: int = Field(default=200, ge=1, le=2000)
     list_cache_seconds: int = Field(default=60, ge=0, le=3600)
     max_display_name_chars: int = Field(default=24, ge=1, le=64)
@@ -663,11 +699,11 @@ class SponsorConfig(BaseSettings):
 
     @model_validator(mode="after")
     def validate_sync_credentials(self):
-        if self.sync_enabled and not (
+        if (self.sync_enabled or self.finance_sync_enabled) and not (
             self.afdian_user_id.strip() and self.afdian_token.strip()
         ):
             raise ValueError(
-                "开启 SPONSOR__SYNC_ENABLED 必须同时配置 "
+                "开启 SPONSOR__SYNC_ENABLED 或 SPONSOR__FINANCE_SYNC_ENABLED 必须同时配置 "
                 "SPONSOR__AFDIAN_USER_ID 与 SPONSOR__AFDIAN_TOKEN"
             )
         return self
@@ -895,6 +931,7 @@ class Settings(BaseSettings):
     cors: CORSConfig = Field(default_factory=CORSConfig)
     admin: AdminConfig = Field(default_factory=AdminConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    viewer_impression: ViewerImpressionConfig = Field(default_factory=ViewerImpressionConfig)
     sc: SCConfig = Field(default_factory=SCConfig)
     sponsor: SponsorConfig = Field(default_factory=SponsorConfig)
     emotes: EmoteConfig = Field(default_factory=EmoteConfig)

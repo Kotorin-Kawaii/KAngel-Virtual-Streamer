@@ -30,6 +30,37 @@ class AccountMemoryExportResponse(AccountMemoryResponse):
     nickname_history: list[dict[str, Any]]
     sc_history: list[dict[str, Any]] = Field(default_factory=list)
     exported_at: str
+    viewer_impression: Optional[dict[str, Any]] = None
+
+
+class ViewerImpressionLetter(BaseModel):
+    revision: int = Field(ge=1)
+    content: str
+    tone: Literal["warm", "playful", "sincere", "reflective"]
+    generated_at: str
+
+
+class ViewerImpressionGeneration(BaseModel):
+    task_id: str
+    status: Literal["pending", "processing", "failed_retryable"]
+    requested_at: str
+    next_attempt_at: Optional[str] = None
+
+
+class ViewerImpressionStatusResponse(BaseModel):
+    status: Literal["unavailable", "empty", "ready", "processing"]
+    reason: Optional[Literal["feature_disabled", "memory_disabled", "role_unavailable"]] = None
+    letter: Optional[ViewerImpressionLetter] = None
+    generation: Optional[ViewerImpressionGeneration] = None
+    can_request: bool
+    next_request_at: Optional[str] = None
+
+
+class ViewerImpressionGenerateResponse(BaseModel):
+    accepted: bool
+    status: Literal["pending", "processing"]
+    task_id: str
+    existing_task: bool = False
 
 
 _SC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
@@ -124,6 +155,69 @@ class SponsorSyncStatsResponse(BaseModel):
     last_success_at: Optional[str] = None
     last_attempt_at: Optional[str] = None
     last_error_code: Optional[str] = None
+
+
+SPONSOR_EXPENSE_CATEGORIES = Literal[
+    "ai_api", "server", "network", "domain", "cdn", "software", "hardware", "other"
+]
+
+
+class SponsorExpenseRequest(BaseModel):
+    month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    amount_cents: int = Field(gt=0, le=100_000_000_000)
+    category: SPONSOR_EXPENSE_CATEGORIES
+    title: str = Field(min_length=1, max_length=120)
+    public_note: Optional[str] = Field(default=None, max_length=500)
+
+
+class SponsorFundEntryResponse(BaseModel):
+    entry_id: str
+    month: str
+    amount_cents: int
+    category: str
+    title: str
+    public_note: Optional[str] = None
+    status: Literal["active", "void"]
+    created_at: str
+    updated_at: str
+
+
+class SponsorFinanceSyncStatsResponse(BaseModel):
+    enabled: bool
+    transparency_enabled: bool
+    credentials_configured: bool
+    synced_count: int
+    consecutive_failures: int
+    last_success_at: Optional[str] = None
+    last_attempt_at: Optional[str] = None
+    last_error_code: Optional[str] = None
+
+
+class SponsorTransparencyExpense(BaseModel):
+    category: str
+    title: str
+    amount_cents: int
+    note: Optional[str] = None
+
+
+class SponsorTransparencyMonth(BaseModel):
+    month: str
+    opening_balance_cents: int
+    received_cents: int
+    spent_cents: int
+    closing_balance_cents: int
+    expenses: list[SponsorTransparencyExpense] = Field(default_factory=list)
+
+
+class SponsorTransparencyResponse(BaseModel):
+    enabled: bool
+    currency: str
+    received_total_cents: int
+    spent_total_cents: int
+    remaining_cents: int
+    supporter_count: int
+    updated_at: Optional[str] = None
+    months: list[SponsorTransparencyMonth] = Field(default_factory=list)
 
 
 class DanmakuResponse(BaseModel):

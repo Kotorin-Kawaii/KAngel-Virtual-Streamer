@@ -11,6 +11,12 @@ from .settings import Settings, settings
 class ConfigManager:
     """配置管理器，支持多配置源"""
 
+    # Viewer Impression owns an asyncio worker pool which is created during
+    # FastAPI lifespan.  Treating its settings as hot-reloadable would leave
+    # an enabled queue without workers (or keep workers running after disable).
+    # Edit the config/.env and restart the service for these values to apply.
+    RESTART_REQUIRED_SECTIONS = frozenset({"viewer_impression"})
+
     # 导出时替换凭据的固定哨兵；回灌时会跳过恰好等于它的值。
     REDACTED = "***"
     SECRET_KEY_MARKERS = ("api_key", "apikey", "token", "secret", "password")
@@ -55,6 +61,11 @@ class ConfigManager:
     
     def set(self, key: str, value: Any):
         """设置配置值"""
+        section = str(key).split(".", 1)[0]
+        if section in self.RESTART_REQUIRED_SECTIONS:
+            raise RuntimeError(
+                "viewer_impression 配置需要重启服务后生效，不能通过运行时配置接口热更新"
+            )
         if self._config_cache is None:
             self._config_cache = {}
         self._config_cache[key] = value
@@ -70,7 +81,7 @@ class ConfigManager:
         try:
             for section in (
                 "server", "ai", "danmaku", "persona", "stream", "memory",
-                "cors", "sc", "emotes", "admin", "rate_limit",
+                "viewer_impression", "cors", "sc", "emotes", "admin", "rate_limit",
             ):
                 source = self._config_cache.get(section)
                 if not isinstance(source, dict):
@@ -114,6 +125,7 @@ class ConfigManager:
             "plugins": settings.plugins.model_dump(),
             "stream": settings.stream.model_dump(),
             "memory": settings.memory.model_dump(),
+            "viewer_impression": settings.viewer_impression.model_dump(),
             "cors": settings.cors.model_dump(),
             "sc": settings.sc.model_dump(),
             "emotes": settings.emotes.model_dump(),

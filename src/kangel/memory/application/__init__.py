@@ -9,6 +9,14 @@ _MODULES = {
     "EpisodicMemoryConsumer": "episodic",
     "episodic_memory_manager": "episodic",
     "episodic_memory_consumer": "episodic",
+    "ViewerImpressionError": "viewer_impression",
+    "ViewerImpressionValidationError": "viewer_impression",
+    "ViewerImpressionPromptBuilder": "viewer_impression",
+    "ViewerImpressionValidator": "viewer_impression",
+    "ViewerImpressionService": "viewer_impression",
+    "ViewerImpressionWorker": "viewer_impression",
+    "viewer_impression_service": "viewer_impression",
+    "viewer_impression_worker": "viewer_impression",
 }
 __all__ = list(_MODULES)
 

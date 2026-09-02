@@ -6,6 +6,7 @@ SQLite 数据库实现
 import sqlite3
 import json
 import hashlib
+import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -21,18 +22,18 @@ class DatabaseManager:
 
     SQLITE_TIMEOUT_SECONDS = 5.0
     SQLITE_BUSY_TIMEOUT_MS = 5000
-
+    
     def __init__(self, db_path: str = None):
         if db_path is None:
             # 默认放在项目根目录下的data文件夹
             data_dir = Path("data")
             data_dir.mkdir(exist_ok=True)
             db_path = str(data_dir / "stream_data.db")
-
+        
         self.db_path = db_path
         self._init_database()
         logger.info(f"数据库初始化成功: {db_path}")
-
+    
     @contextmanager
     def _get_connection(self):
         """获取数据库连接上下文管理器"""
@@ -51,7 +52,7 @@ class DatabaseManager:
             raise
         finally:
             conn.close()
-
+    
     def _init_database(self):
         """初始化数据库表结构"""
         with self._get_connection() as conn:
@@ -60,7 +61,7 @@ class DatabaseManager:
             if self.db_path != ":memory:":
                 conn.execute("PRAGMA journal_mode = WAL")
             cursor = conn.cursor()
-
+            
             # 弹幕记录表
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS danmaku_records (
@@ -74,7 +75,7 @@ class DatabaseManager:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
+            
             # 弹幕回复记录表
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reply_records (
@@ -85,31 +86,31 @@ class DatabaseManager:
                     danmaku_id TEXT NOT NULL,
                     danmaku_nickname TEXT NOT NULL,
                     danmaku_message TEXT NOT NULL,
-
+                    
                     ai_reply TEXT NOT NULL,
                     ai_emotions TEXT,
-
+                    
                     mood_before REAL,
                     stress_before REAL,
                     darkness_before REAL,
-
+                    
                     mood_impact REAL DEFAULT 0,
                     stress_impact REAL DEFAULT 0,
                     darkness_impact REAL DEFAULT 0,
-
+                    
                     mood_after REAL,
                     stress_after REAL,
                     darkness_after REAL,
-
+                    
                     emotional_tone TEXT,
                     content_intensity REAL,
                     context_relevance REAL,
                     analysis_reasoning TEXT,
                     key_factors TEXT,
-
+                    
                     selected_at TEXT NOT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-
+                    
                     FOREIGN KEY (danmaku_record_id) REFERENCES danmaku_records(id)
                 )
             """)
@@ -139,7 +140,7 @@ class DatabaseManager:
                     PRIMARY KEY (stream_session_id, source_type, danmaku_id)
                 )
             """)
-
+            
             # 人格状态表
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS persona_state (
@@ -356,12 +357,89 @@ class DatabaseManager:
                     FOREIGN KEY (account_id) REFERENCES accounts(account_id)
                 )
             """)
+            # Viewer Impression：账号当前展示留言与异步生成任务完全独立于实时回复链。
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS account_viewer_impressions (
+                    account_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    content TEXT NOT NULL,
+                    tone TEXT NOT NULL DEFAULT 'warm',
+                    generated_at TEXT NOT NULL,
+                    next_request_at TEXT NOT NULL,
+                    evidence_cutoff_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+                )
+            """)
+            impression_columns = {
+                row[1] for row in cursor.execute(
+                    "PRAGMA table_info(account_viewer_impressions)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("evidence_refs_json", "TEXT"),
+                ("evidence_counts_json", "TEXT"),
+                ("snapshot_hash", "TEXT"),
+            ):
+                if column not in impression_columns:
+                    cursor.execute(
+                        f"ALTER TABLE account_viewer_impressions ADD COLUMN {column} {definition}"
+                    )
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS account_viewer_impression_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    lease_expires_at TEXT,
+                    execution_token TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    error_code TEXT,
+                    error_detail TEXT,
+                    target_revision INTEGER NOT NULL,
+                    evidence_snapshot TEXT,
+                    evidence_cutoff_at TEXT,
+                    provider TEXT,
+                    model TEXT,
+                    latency_ms INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (account_id) REFERENCES accounts(account_id),
+                    CHECK(status IN ('pending', 'processing', 'completed', 'failed_retryable', 'failed', 'cancelled')),
+                    CHECK(target_revision >= 1)
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_viewer_impression_tasks_status "
+                "ON account_viewer_impression_tasks(status, next_attempt_at, created_at)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_viewer_impression_tasks_account "
+                "ON account_viewer_impression_tasks(account_id, created_at DESC)"
+            )
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_viewer_impression_active_task "
+                "ON account_viewer_impression_tasks(account_id) "
+                "WHERE status IN ('pending', 'processing', 'failed_retryable')"
+            )
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     migration_id TEXT PRIMARY KEY,
                     applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id) "
+                "VALUES ('account_viewer_impression_v1')"
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id) "
+                "VALUES ('account_viewer_impression_v2_audit')"
+            )
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS streamer_activity_sessions (
                     stream_session_id TEXT PRIMARY KEY,
@@ -731,6 +809,52 @@ class DatabaseManager:
                     updated_at TEXT NOT NULL
                 )
             """)
+            # Sponsor Fund Transparency：收入账本与 sponsor_records 身份账本物理分离。
+            # 这里只保存不可逆订单键、金额、可靠付款时间与聚合月份，不保存任何赞助者字段。
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sponsor_orders (
+                    order_key TEXT PRIMARY KEY,
+                    platform TEXT NOT NULL,
+                    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+                    paid_at TEXT NOT NULL,
+                    accounting_month TEXT NOT NULL,
+                    order_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sponsor_orders_month "
+                "ON sponsor_orders(platform, accounting_month)"
+            )
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sponsor_finance_sync_state (
+                    platform TEXT PRIMARY KEY,
+                    last_success_at TEXT,
+                    last_attempt_at TEXT,
+                    last_error_code TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    synced_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sponsor_fund_entries (
+                    entry_id TEXT PRIMARY KEY,
+                    month TEXT NOT NULL,
+                    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    public_note TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('active', 'void')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sponsor_fund_entries_month "
+                "ON sponsor_fund_entries(month, status)"
+            )
 
             # P29 AI token 用量审计：只记调用元数据与 token 计数。
             # 没有 prompt/回复正文、message_id、昵称、账号或 IP，因此不含任何 PII；
@@ -910,7 +1034,7 @@ class DatabaseManager:
                 "INSERT OR IGNORE INTO schema_migrations(migration_id) "
                 "VALUES ('account_identity_v1')"
             )
-
+            
             # 创建索引
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_timestamp ON danmaku_records(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_reply_selected_at ON reply_records(selected_at)")
@@ -1005,11 +1129,11 @@ class DatabaseManager:
             # P24 reliability metadata is a formal, idempotent migration so
             # this initializer can safely open the old production database.
             upgrade_stream_memory_reliability_v1(conn)
-
+            
             logger.debug("数据库表结构初始化完成")
-
+    
     # ==================== 弹幕记录操作 ====================
-
+    
     def record_danmaku(
         self,
         danmaku_id: str,
@@ -1025,19 +1149,19 @@ class DatabaseManager:
         """
         if timestamp is None:
             timestamp = datetime.now().isoformat()
-
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO danmaku_records
+                INSERT INTO danmaku_records 
                 (danmaku_id, nickname, message, client_ip, sender_level, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (danmaku_id, nickname, message, client_ip, sender_level, timestamp))
-
+            
             record_id = cursor.lastrowid
             logger.debug(f"弹幕已记录 [ID: {record_id}]: {nickname} - {message[:30]}")
             return record_id
-
+    
     def get_danmaku_records(
         self,
         limit: int = 100,
@@ -1048,22 +1172,22 @@ class DatabaseManager:
         """获取弹幕记录列表"""
         query = "SELECT * FROM danmaku_records WHERE 1=1"
         params = []
-
+        
         if start_time:
             query += " AND timestamp >= ?"
             params.append(start_time)
         if end_time:
             query += " AND timestamp <= ?"
             params.append(end_time)
-
+        
         query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
-
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
-
+    
     def get_danmaku_by_id(self, danmaku_id: str) -> Optional[Dict[str, Any]]:
         """根据danmaku_id获取弹幕记录"""
         with self._get_connection() as conn:
@@ -1071,7 +1195,7 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM danmaku_records WHERE danmaku_id = ?", (danmaku_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
-
+    
     def get_danmaku_count(
         self,
         start_time: Optional[str] = None,
@@ -1080,19 +1204,19 @@ class DatabaseManager:
         """获取弹幕数量"""
         query = "SELECT COUNT(*) as count FROM danmaku_records WHERE 1=1"
         params = []
-
+        
         if start_time:
             query += " AND timestamp >= ?"
             params.append(start_time)
         if end_time:
             query += " AND timestamp <= ?"
             params.append(end_time)
-
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return cursor.fetchone()["count"]
-
+    
     # ==================== 回复记录操作 ====================
 
     def claim_danmaku_processing(
@@ -1167,7 +1291,7 @@ class DatabaseManager:
                 source_event_id, event_type, datetime.now(timezone.utc).isoformat()
             ))
             return cursor.rowcount == 1
-
+    
     def record_reply(
         self,
         danmaku_id: str,
@@ -1199,18 +1323,18 @@ class DatabaseManager:
         """
         if selected_at is None:
             selected_at = datetime.now().isoformat()
-
+        
         if mood_after is None:
             mood_after = mood_before + mood_impact
         if stress_after is None:
             stress_after = stress_before + stress_impact
         if darkness_after is None:
             darkness_after = darkness_before + darkness_impact
-
+        
         ai_reply_json = json.dumps(ai_reply, ensure_ascii=False)
         ai_emotions_json = json.dumps(ai_reply.get("emotions", []), ensure_ascii=False) if ai_reply else None
         key_factors_json = json.dumps(key_factors, ensure_ascii=False) if key_factors else None
-
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -1236,11 +1360,11 @@ class DatabaseManager:
                 analysis_reasoning, key_factors_json,
                 selected_at
             ))
-
+            
             record_id = cursor.lastrowid
             logger.debug(f"回复已记录 [ID: {record_id}]: {danmaku_nickname} - {danmaku_message[:30]}")
             return record_id
-
+    
     def get_reply_records(
         self,
         limit: int = 100,
@@ -1251,21 +1375,21 @@ class DatabaseManager:
         """获取回复记录列表"""
         query = "SELECT * FROM reply_records WHERE 1=1"
         params = []
-
+        
         if start_time:
             query += " AND selected_at >= ?"
             params.append(start_time)
         if end_time:
             query += " AND selected_at <= ?"
             params.append(end_time)
-
+        
         query += " ORDER BY selected_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
-
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
-
+            
             records = []
             for row in cursor.fetchall():
                 record = dict(row)
@@ -1277,9 +1401,9 @@ class DatabaseManager:
                 if record.get("key_factors"):
                     record["key_factors"] = json.loads(record["key_factors"])
                 records.append(record)
-
+            
             return records
-
+    
     def get_reply_count(
         self,
         start_time: Optional[str] = None,
@@ -1288,14 +1412,14 @@ class DatabaseManager:
         """获取回复数量"""
         query = "SELECT COUNT(*) as count FROM reply_records WHERE 1=1"
         params = []
-
+        
         if start_time:
             query += " AND selected_at >= ?"
             params.append(start_time)
         if end_time:
             query += " AND selected_at <= ?"
             params.append(end_time)
-
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
@@ -1326,9 +1450,9 @@ class DatabaseManager:
                     parsed = []
             emotions.extend(str(item) for item in parsed)
         return emotions[-limit:]
-
+    
     # ==================== 数据导出 ====================
-
+    
     def export_danmaku_data(
         self,
         start_time: Optional[str] = None,
@@ -1343,13 +1467,13 @@ class DatabaseManager:
             start_time=start_time,
             end_time=end_time
         )
-
+        
         reply_records = self.get_reply_records(
             limit=10000,
             start_time=start_time,
             end_time=end_time
         )
-
+        
         # 建立弹幕ID到回复的映射
         reply_map = {}
         for reply in reply_records:
@@ -1357,7 +1481,7 @@ class DatabaseManager:
             if danmaku_id not in reply_map:
                 reply_map[danmaku_id] = []
             reply_map[danmaku_id].append(reply)
-
+        
         # 构建完整数据集
         export_data = {
             "export_time": datetime.now().isoformat(),
@@ -1373,15 +1497,15 @@ class DatabaseManager:
             "reply_records": reply_records,
             "danmaku_with_replies": []
         }
-
+        
         # 为每条弹幕添加对应的回复
         for danmaku in danmaku_records:
             danmaku_data = danmaku.copy()
             danmaku_data["replies"] = reply_map.get(danmaku["danmaku_id"], [])
             export_data["danmaku_with_replies"].append(danmaku_data)
-
+        
         return export_data
-
+    
     def get_stats(self) -> Dict[str, Any]:
         """获取数据库统计信息"""
         return {
@@ -2918,38 +3042,38 @@ class DatabaseManager:
             ).rowcount
         return {"records": max(0, deleted)}
 
-
+    
     def clear_old_data(self, days_to_keep: int = 30):
         """清理旧数据（默认保留30天）"""
         cutoff_time = (datetime.now() - timedelta(days=days_to_keep)).isoformat()
-
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
-
+            
             # 删除旧的回复记录
             cursor.execute("DELETE FROM reply_records WHERE selected_at < ?", (cutoff_time,))
             reply_deleted = cursor.rowcount
-
+            
             # 删除旧的弹幕记录
             cursor.execute("DELETE FROM danmaku_records WHERE timestamp < ?", (cutoff_time,))
             danmaku_deleted = cursor.rowcount
-
+            
             # 只保留最新的10条人格状态记录
             cursor.execute("""
-                DELETE FROM persona_state
+                DELETE FROM persona_state 
                 WHERE id NOT IN (
                     SELECT id FROM persona_state ORDER BY updated_at DESC LIMIT 10
                 )
             """)
             persona_deleted = cursor.rowcount
-
+            
             logger.info(f"清理旧数据完成: 删除了 {danmaku_deleted} 条弹幕, {reply_deleted} 条回复, {persona_deleted} 条人格状态记录")
             return {
                 "danmaku_deleted": danmaku_deleted,
                 "reply_deleted": reply_deleted,
                 "persona_deleted": persona_deleted
             }
-
+    
     # ==================== 人格状态操作 ====================
 
     def claim_stream_special_date_bias(
@@ -3099,7 +3223,7 @@ class DatabaseManager:
                     (account_id, used_at),
                 )
             return True
-
+    
     def save_persona_state(self, mood: float, stress: float, darkness: float) -> int:
         """
         保存人格状态
@@ -3111,11 +3235,11 @@ class DatabaseManager:
                 INSERT INTO persona_state (mood, stress, darkness)
                 VALUES (?, ?, ?)
             """, (mood, stress, darkness))
-
+            
             record_id = cursor.lastrowid
             logger.debug(f"人格状态已保存 [ID: {record_id}]: mood={mood:.2f}, stress={stress:.2f}, darkness={darkness:.2f}")
             return record_id
-
+    
     def get_latest_persona_state(self) -> Optional[Dict[str, Any]]:
         """
         获取最新的人格状态
@@ -3124,9 +3248,9 @@ class DatabaseManager:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT mood, stress, darkness, updated_at
-                FROM persona_state
-                ORDER BY id DESC
+                SELECT mood, stress, darkness, updated_at 
+                FROM persona_state 
+                ORDER BY id DESC 
                 LIMIT 1
             """)
             row = cursor.fetchone()
@@ -3470,6 +3594,22 @@ class DatabaseManager:
                 conn.execute(
                     "DELETE FROM stream_english_surprise_jokes WHERE viewer_scope = ?",
                     (f"account:{account_id}",),
+                )
+            if "account_viewer_impression_tasks" in tables:
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute("""
+                    UPDATE account_viewer_impression_tasks
+                    SET status = 'cancelled', execution_token = NULL,
+                        lease_expires_at = NULL, evidence_snapshot = NULL,
+                        error_code = 'memory_disabled', error_detail = NULL,
+                        updated_at = ?
+                    WHERE account_id = ?
+                      AND status IN ('pending', 'processing', 'failed_retryable')
+                """, (now, account_id))
+            if "account_viewer_impressions" in tables:
+                conn.execute(
+                    "DELETE FROM account_viewer_impressions WHERE account_id = ?",
+                    (account_id,),
                 )
         # P24 情景记忆与关系、长期片段同属人物记忆治理边界；安全状态不在此处清理。
         self.delete_account_episodic_memory(account_id)
@@ -3818,6 +3958,389 @@ class DatabaseManager:
                 WHERE last_seen_at < ?
             """, (cutoff,))
             return cursor.rowcount
+
+    # ==================== Viewer Impression（低频账号留言） ====================
+
+    def get_account_viewer_impression(self, account_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_viewer_impressions WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_active_account_viewer_impression_task(
+        self, account_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute("""
+                SELECT * FROM account_viewer_impression_tasks
+                WHERE account_id = ?
+                  AND status IN ('pending', 'processing', 'failed_retryable')
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (account_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_account_viewer_impression_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_viewer_impression_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_account_viewer_impression_task(
+        self,
+        *,
+        account_id: str,
+        requested_at: str,
+        evidence_snapshot: str,
+        evidence_cutoff_at: str,
+        cooldown_days: int,
+        max_pending_tasks: int,
+    ) -> Dict[str, Any]:
+        """原子执行 active-task、冷却和容量检查并创建一条冻结快照任务。"""
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            preference = conn.execute(
+                "SELECT long_term_memory_enabled FROM account_memory_preferences WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if preference is not None and not bool(preference[0]):
+                return {"status": "memory_disabled"}
+
+            active = conn.execute("""
+                SELECT task_id, status, requested_at, next_attempt_at
+                FROM account_viewer_impression_tasks
+                WHERE account_id = ?
+                  AND status IN ('pending', 'processing', 'failed_retryable')
+                ORDER BY created_at DESC LIMIT 1
+            """, (account_id,)).fetchone()
+            if active:
+                return {
+                    "status": "active",
+                    "task_id": active["task_id"],
+                    "task_status": active["status"],
+                    "requested_at": active["requested_at"],
+                    "next_attempt_at": active["next_attempt_at"],
+                    "existing_task": True,
+                }
+
+            current = conn.execute(
+                "SELECT revision, next_request_at FROM account_viewer_impressions WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if current and current["next_request_at"]:
+                try:
+                    if datetime.fromisoformat(current["next_request_at"]) > datetime.fromisoformat(requested_at):
+                        return {
+                            "status": "cooldown",
+                            "next_request_at": current["next_request_at"],
+                        }
+                except (TypeError, ValueError):
+                    pass
+
+            pending_count = conn.execute("""
+                SELECT COUNT(*) FROM account_viewer_impression_tasks
+                WHERE status IN ('pending', 'processing', 'failed_retryable')
+            """).fetchone()[0]
+            if int(pending_count) >= max(1, int(max_pending_tasks)):
+                return {"status": "capacity"}
+
+            target_revision = int(current["revision"] if current else 0) + 1
+            task_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO account_viewer_impression_tasks (
+                    task_id, account_id, status, requested_at, attempt_count,
+                    next_attempt_at, target_revision, evidence_snapshot,
+                    evidence_cutoff_at, created_at, updated_at
+                ) VALUES (?, ?, 'pending', ?, 0, ?, ?, ?, ?, ?, ?)
+            """, (
+                task_id, account_id, requested_at, None, target_revision,
+                evidence_snapshot, evidence_cutoff_at, requested_at, requested_at,
+            ))
+            return {
+                "status": "pending",
+                "task_id": task_id,
+                "task_status": "pending",
+                "target_revision": target_revision,
+                "existing_task": False,
+                "next_request_at": (
+                    datetime.fromisoformat(requested_at) + timedelta(days=cooldown_days)
+                ).isoformat(),
+            }
+
+    def claim_account_viewer_impression_task(
+        self, *, now: str, lease_seconds: int, max_attempts: int
+    ) -> Optional[Dict[str, Any]]:
+        """领取一条任务；过期 processing lease 在同一事务中回收。"""
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                UPDATE account_viewer_impression_tasks
+                SET status = 'failed_retryable', lease_expires_at = NULL,
+                    execution_token = NULL, next_attempt_at = ?,
+                    error_code = 'lease_expired', error_detail = 'worker lease expired',
+                    updated_at = ?
+                WHERE status = 'processing'
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            """, (now, now, now))
+
+            while True:
+                row = conn.execute("""
+                    SELECT * FROM account_viewer_impression_tasks
+                    WHERE status = 'pending'
+                       OR (status = 'failed_retryable'
+                           AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                """, (now,)).fetchone()
+                if not row:
+                    return None
+                if int(row["attempt_count"] or 0) >= max(1, int(max_attempts)):
+                    conn.execute("""
+                        UPDATE account_viewer_impression_tasks
+                        SET status = 'failed', error_code = COALESCE(error_code, 'max_attempts'),
+                            evidence_snapshot = NULL, updated_at = ?
+                        WHERE task_id = ? AND status IN ('pending', 'failed_retryable')
+                    """, (now, row["task_id"]))
+                    continue
+                token = str(uuid.uuid4())
+                lease_expires = (
+                    datetime.fromisoformat(now) + timedelta(seconds=lease_seconds)
+                ).isoformat()
+                updated = conn.execute("""
+                    UPDATE account_viewer_impression_tasks
+                    SET status = 'processing', started_at = COALESCE(started_at, ?),
+                        lease_expires_at = ?, execution_token = ?, next_attempt_at = NULL,
+                        attempt_count = attempt_count + 1, updated_at = ?
+                    WHERE task_id = ? AND status IN ('pending', 'failed_retryable')
+                """, (now, lease_expires, token, now, row["task_id"]))
+                if updated.rowcount != 1:
+                    continue
+                claimed = dict(row)
+                claimed.update({
+                    "status": "processing", "execution_token": token,
+                    "lease_expires_at": lease_expires,
+                    "attempt_count": int(row["attempt_count"] or 0) + 1,
+                })
+                return claimed
+
+    def renew_account_viewer_impression_task_lease(
+        self,
+        *,
+        task_id: str,
+        execution_token: str,
+        now: str,
+        lease_seconds: int,
+    ) -> bool:
+        lease_expires = (
+            datetime.fromisoformat(now) + timedelta(seconds=lease_seconds)
+        ).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.execute("""
+                UPDATE account_viewer_impression_tasks
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE task_id = ? AND status = 'processing'
+                  AND execution_token = ?
+            """, (lease_expires, now, task_id, execution_token))
+            return cursor.rowcount == 1
+
+    def release_account_viewer_impression_task(
+        self, *, task_id: str, execution_token: str, now: str
+    ) -> bool:
+        """因 provider 暂不在营业时间而释放领取，不消耗 attempt。"""
+        with self._get_connection() as conn:
+            cursor = conn.execute("""
+                UPDATE account_viewer_impression_tasks
+                SET status = 'pending', started_at = NULL,
+                    lease_expires_at = NULL, execution_token = NULL,
+                    attempt_count = MAX(0, attempt_count - 1),
+                    next_attempt_at = NULL, updated_at = ?
+                WHERE task_id = ? AND status = 'processing'
+                  AND execution_token = ?
+            """, (now, task_id, execution_token))
+            return cursor.rowcount == 1
+
+    def complete_account_viewer_impression_task(
+        self,
+        *,
+        task_id: str,
+        account_id: str,
+        execution_token: str,
+        content: str,
+        tone: str,
+        generated_at: str,
+        next_request_at: str,
+        provider: Optional[str],
+        model: Optional[str],
+        latency_ms: int,
+        evidence_refs_json: Optional[str] = None,
+        evidence_counts_json: Optional[str] = None,
+        snapshot_hash: Optional[str] = None,
+    ) -> bool:
+        """验证租约后原子替换 current letter，旧留言直到本事务提交都保留。"""
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute("""
+                SELECT target_revision, evidence_cutoff_at, lease_expires_at
+                FROM account_viewer_impression_tasks
+                WHERE task_id = ? AND account_id = ? AND status = 'processing'
+                  AND execution_token = ?
+            """, (task_id, account_id, execution_token)).fetchone()
+            if not task:
+                return False
+            if task["lease_expires_at"]:
+                try:
+                    if datetime.fromisoformat(task["lease_expires_at"]) <= datetime.fromisoformat(generated_at):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            pref = conn.execute(
+                "SELECT long_term_memory_enabled FROM account_memory_preferences WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if pref is not None and not bool(pref[0]):
+                conn.execute("""
+                    UPDATE account_viewer_impression_tasks
+                    SET status = 'cancelled', execution_token = NULL,
+                        lease_expires_at = NULL, evidence_snapshot = NULL,
+                        error_code = 'memory_disabled', updated_at = ?
+                    WHERE task_id = ?
+                """, (generated_at, task_id))
+                conn.execute(
+                    "DELETE FROM account_viewer_impressions WHERE account_id = ?",
+                    (account_id,),
+                )
+                return False
+
+            current = conn.execute(
+                "SELECT revision FROM account_viewer_impressions WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            expected_previous = int(task["target_revision"]) - 1
+            if current and int(current["revision"]) != expected_previous:
+                conn.execute("""
+                    UPDATE account_viewer_impression_tasks
+                    SET status = 'failed', execution_token = NULL,
+                        lease_expires_at = NULL, evidence_snapshot = NULL,
+                        error_code = 'stale_revision', updated_at = ?
+                    WHERE task_id = ?
+                """, (generated_at, task_id))
+                return False
+            conn.execute("""
+                INSERT INTO account_viewer_impressions (
+                    account_id, revision, content, tone, generated_at,
+                    next_request_at, evidence_cutoff_at, created_at, updated_at,
+                    evidence_refs_json, evidence_counts_json, snapshot_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    revision=excluded.revision, content=excluded.content,
+                    tone=excluded.tone, generated_at=excluded.generated_at,
+                    next_request_at=excluded.next_request_at,
+                    evidence_cutoff_at=excluded.evidence_cutoff_at,
+                    evidence_refs_json=excluded.evidence_refs_json,
+                    evidence_counts_json=excluded.evidence_counts_json,
+                    snapshot_hash=excluded.snapshot_hash,
+                    updated_at=excluded.updated_at
+            """, (
+                account_id, int(task["target_revision"]), content, tone,
+                generated_at, next_request_at, task["evidence_cutoff_at"],
+                generated_at, generated_at, evidence_refs_json,
+                evidence_counts_json, snapshot_hash,
+            ))
+            updated = conn.execute("""
+                UPDATE account_viewer_impression_tasks
+                SET status = 'completed', completed_at = ?,
+                    lease_expires_at = NULL, execution_token = NULL,
+                    next_attempt_at = NULL, error_code = NULL, error_detail = NULL,
+                    evidence_snapshot = NULL, provider = ?, model = ?,
+                    latency_ms = ?, updated_at = ?
+                WHERE task_id = ? AND status = 'processing'
+                  AND execution_token = ?
+            """, (
+                generated_at, provider, model, latency_ms, generated_at,
+                task_id, execution_token,
+            ))
+            if updated.rowcount != 1:
+                # The current-letter upsert and task completion are one atomic
+                # commit.  A defensive invariant failure must roll both back,
+                # never leave a letter committed without a completed task.
+                raise RuntimeError("viewer impression task completion invariant failed")
+            return True
+
+    def fail_account_viewer_impression_task(
+        self,
+        *,
+        task_id: str,
+        execution_token: str,
+        now: str,
+        error_code: str,
+        error_detail: str,
+        retryable: bool,
+        next_attempt_at: Optional[str],
+    ) -> bool:
+        with self._get_connection() as conn:
+            status = "failed_retryable" if retryable else "failed"
+            cursor = conn.execute("""
+                UPDATE account_viewer_impression_tasks
+                SET status = ?, lease_expires_at = NULL, execution_token = NULL,
+                    next_attempt_at = ?, error_code = ?, error_detail = ?,
+                    evidence_snapshot = CASE WHEN ? = 'failed_retryable' THEN evidence_snapshot ELSE NULL END,
+                    updated_at = ?
+                WHERE task_id = ? AND status = 'processing' AND execution_token = ?
+            """, (
+                status, next_attempt_at, error_code, error_detail, status,
+                now, task_id, execution_token,
+            ))
+            return cursor.rowcount == 1
+
+    def cancel_account_viewer_impression_tasks(self, account_id: str, *, now: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute("""
+                UPDATE account_viewer_impression_tasks
+                SET status = 'cancelled', lease_expires_at = NULL,
+                    execution_token = NULL, evidence_snapshot = NULL,
+                    error_code = 'memory_disabled', error_detail = NULL, updated_at = ?
+                WHERE account_id = ?
+                  AND status IN ('pending', 'processing', 'failed_retryable')
+            """, (now, account_id))
+            conn.execute(
+                "DELETE FROM account_viewer_impressions WHERE account_id = ?",
+                (account_id,),
+            )
+
+    def list_account_viewer_impression_export(self, account_id: str) -> Optional[Dict[str, Any]]:
+        row = self.get_account_viewer_impression(account_id)
+        if not row:
+            return None
+        return {
+            "revision": int(row["revision"]),
+            "content": row["content"],
+            "generated_at": row["generated_at"],
+            "next_request_at": row["next_request_at"],
+        }
+
+    def get_viewer_impression_stats(self) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            counts = {
+                row["status"]: int(row["count"])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM account_viewer_impression_tasks GROUP BY status"
+                ).fetchall()
+            }
+            row = conn.execute("""
+                SELECT COUNT(*) AS total, AVG(latency_ms) AS average_latency_ms,
+                       MAX(completed_at) AS last_success_at
+                FROM account_viewer_impression_tasks WHERE status = 'completed'
+            """).fetchone()
+            return {
+                "task_status_counts": counts,
+                "completed_total": int(row["total"] or 0),
+                "average_latency_ms": round(float(row["average_latency_ms"] or 0.0), 2),
+                "last_success_at": row["last_success_at"],
+            }
 
     # ==================== 账号长期对话与话题记忆 ====================
 

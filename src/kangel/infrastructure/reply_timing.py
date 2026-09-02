@@ -10,10 +10,19 @@ import threading
 _STAGES = {
     "context", "qa_selection", "impact_analysis", "prompt_build",
     "reply_model", "output_validation", "state_commit", "broadcast", "total",
+    # 延迟优化 v1 §2：补齐注意力闸门、审核、并行关键路径、提交细分与到达锚点。
+    "attention", "moderation", "parallel_context_critical_path",
+    "memory_commit", "reply_record", "read_to_reply", "arrival_to_reply",
+    # 单次 API attempt 的耗时，与上面的「逻辑阶段」分开统计：
+    # 带回退的一次逻辑调用会产生多次 attempt，两者混在一起会低估回退成本。
+    "api_attempt",
 }
 _PATHS = {"normal", "sc"}
-_OUTCOMES = {"success", "error", "skipped", "degraded", "retry"}
-_MODEL_ROLES = {"none", "qa", "impact", "reply"}
+_OUTCOMES = {"success", "error", "skipped", "degraded", "retry", "fallback"}
+_MODEL_ROLES = {
+    "none", "qa", "impact", "reply", "attention", "moderation",
+    "intent_shadow", "session_memory", "stream_director", "default",
+}
 
 
 class ReplyTimingMetrics:

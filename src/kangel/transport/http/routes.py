@@ -26,6 +26,7 @@ from .auth_schemas import (
 from .schemas import (
     MemoryPreferenceUpdateRequest, MemoryPreferenceResponse,
     AccountMemoryResponse, AccountMemoryExportResponse,
+    ViewerImpressionStatusResponse, ViewerImpressionGenerateResponse,
 )
 from .schemas import (
     SCConfigResponse, SCSubmitRequest, SCSubmitResponse, SCStatusResponse,
@@ -33,12 +34,15 @@ from .schemas import (
 from .schemas import EmoteConfigResponse
 from .schemas import (
     SponsorConfigResponse, SponsorListResponse, SponsorSyncStatsResponse,
+    SponsorExpenseRequest, SponsorFundEntryResponse, SponsorFinanceSyncStatsResponse,
+    SponsorTransparencyResponse,
 )
 from kangel.transport.websocket.connection_manager import connection_manager
 from kangel.persona.application.engine import persona_engine
 from kangel.infrastructure.event_bus import event_bus
 from kangel.danmaku.application.pool import danmaku_pool
 from kangel.danmaku.application.selector import danmaku_selector
+from kangel.danmaku.application.attention_metrics import attention_gate_metrics
 from kangel.stream.application.mood_pusher import mood_pusher
 from kangel.stream.application.metadata import stream_metadata_pusher
 from kangel.stream.application.session_summary import stream_session_summary_consumer
@@ -47,6 +51,7 @@ from kangel.persona.application.impact_analyzer import persona_impact_analyzer
 from kangel.persona.application.runtime import persona_dynamics, persona_event_pipeline
 from kangel.infrastructure.database import db_manager
 from kangel.infrastructure.reply_timing import reply_timing_metrics
+from kangel.infrastructure.timing_trace import current_trace_id, timing_trace_recorder
 from kangel.infrastructure.prompt_budget import prompt_budget_metrics
 from kangel.integrations.ai.persona import persona_prompt_metrics
 from kangel.danmaku.application.memory import danmaku_memory_manager
@@ -63,6 +68,9 @@ from kangel.infrastructure.auth import (
 )
 from kangel.infrastructure.bounded_work_gate import ai_reply_work_gate
 from kangel.memory.application.governance import account_memory_governance_service
+from kangel.memory.application.viewer_impression import (
+    ViewerImpressionError, viewer_impression_service, viewer_impression_worker,
+)
 from kangel.integrations.superchat.service import (
     SCCooldownError, SCContentRejectedError, SCIdConflictError, SCNotFoundError,
     SCQueueFullError,
@@ -71,6 +79,9 @@ from kangel.integrations.superchat.service import (
 from kangel.integrations.superchat.consumer import sc_consumer
 from kangel.integrations.sponsor.service import sponsor_service
 from kangel.integrations.sponsor.sync_worker import sponsor_sync_worker
+from kangel.integrations.sponsor.client import AfdianError
+from kangel.integrations.sponsor.finance import SponsorFinanceError, sponsor_finance_service
+from kangel.integrations.sponsor.finance_sync_worker import sponsor_finance_sync_worker
 from kangel.integrations.ai import token_report
 from kangel.integrations.ai.service import ai_service
 from kangel.integrations.ai.schemas import (
@@ -732,6 +743,85 @@ async def delete_account_memory(request: Request):
     return Response(status_code=204)
 
 
+@router.get(
+    "/auth/profile/impression",
+    response_model=ViewerImpressionStatusResponse,
+    responses={401: {"description": "访问令牌无效或已过期"}},
+)
+async def get_account_viewer_impression(request: Request):
+    """读取当前账号的 Viewer Impression 状态；不返回内部证据或模型信息。"""
+    principal = await _require_http_principal(request)
+    limited = _enforce_profile_rate_limit(principal.account_id, write=False)
+    if limited:
+        return limited
+    return await asyncio.to_thread(
+        viewer_impression_service.get_status, principal.account_id
+    )
+
+
+@router.post(
+    "/auth/profile/impression/generate",
+    response_model=ViewerImpressionGenerateResponse,
+    status_code=202,
+    responses={
+        401: {"description": "访问令牌无效或已过期"},
+        409: {"description": "长期记忆未开启或证据不足"},
+        429: {"description": "留言仍在冷却期"},
+        503: {"description": "留言生成暂不可用或队列已满"},
+    },
+)
+async def request_account_viewer_impression(request: Request):
+    """冻结证据并立即入队，HTTP 请求不等待模型生成。"""
+    principal = await _require_http_principal(request)
+    limited = _enforce_profile_rate_limit(principal.account_id, write=True)
+    if limited:
+        return limited
+    try:
+        return await asyncio.to_thread(
+            viewer_impression_service.request, principal.account_id
+        )
+    except ViewerImpressionError as exc:
+        if exc.code == "cooldown":
+            current = await asyncio.to_thread(
+                viewer_impression_service.get_status, principal.account_id
+            )
+            next_at = current.get("next_request_at")
+            retry_after = 1
+            if next_at:
+                try:
+                    retry_after = max(
+                        1,
+                        int((datetime.fromisoformat(next_at) - datetime.now(timezone.utc)).total_seconds()),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "code": "viewer_impression_cooldown",
+                    "message": str(exc),
+                    "next_request_at": next_at,
+                    "retry_after_seconds": retry_after,
+                },
+                headers={"Retry-After": str(retry_after)},
+            )
+        if exc.code in {"insufficient_memory", "memory_disabled"}:
+            return JSONResponse(
+                status_code=409,
+                content={"code": exc.code, "message": str(exc)},
+            )
+        if exc.code == "capacity":
+            return JSONResponse(
+                status_code=503,
+                content={"code": "viewer_impression_capacity", "message": str(exc)},
+                headers={"Retry-After": "5"},
+            )
+        return JSONResponse(
+            status_code=503,
+            content={"code": exc.code, "message": str(exc)},
+        )
+
+
 @router.post(
     "/sc",
     response_model=SCSubmitResponse,
@@ -868,6 +958,12 @@ async def list_sponsors():
     return await asyncio.to_thread(sponsor_service.list_public)
 
 
+@router.get("/sponsor/transparency", response_model=SponsorTransparencyResponse)
+async def get_sponsor_transparency():
+    """公开资金聚合；不返回订单键、赞助者身份或任何单人金额。"""
+    return await asyncio.to_thread(sponsor_finance_service.public_transparency)
+
+
 @router.get(
     "/admin/sponsor/stats",
     response_model=SponsorSyncStatsResponse,
@@ -876,6 +972,77 @@ async def list_sponsors():
 async def get_sponsor_sync_stats():
     """赞助名单同步健康度；不返回凭据，也不返回单人金额。"""
     return await asyncio.to_thread(sponsor_service.get_stats)
+
+
+@router.get(
+    "/admin/sponsor/finance/stats",
+    response_model=SponsorFinanceSyncStatsResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def get_sponsor_finance_stats():
+    """资金收入同步健康度；不返回凭据或原始订单。"""
+    return await asyncio.to_thread(sponsor_finance_service.get_sync_stats)
+
+
+@router.post("/admin/sponsor/finance/sync", dependencies=ADMIN_ONLY)
+async def sync_sponsor_finance():
+    """管理员手动触发一次有界订单同步。"""
+    if not settings.sponsor.finance_sync_enabled:
+        raise HTTPException(status_code=409, detail="资金同步未启用")
+    try:
+        count = await sponsor_finance_sync_worker.run_once()
+    except (AfdianError, SponsorFinanceError) as exc:
+        raise HTTPException(status_code=502, detail=f"资金同步失败：{getattr(exc, 'code', 'sync_error')}") from exc
+    except Exception as exc:
+        logger.exception("手动赞助资金同步异常")
+        raise HTTPException(status_code=503, detail="资金同步暂不可用") from exc
+    return {"success": True, "synced_count": count}
+
+
+@router.get(
+    "/admin/sponsor/expenses",
+    response_model=list[SponsorFundEntryResponse],
+    dependencies=ADMIN_ONLY,
+)
+async def list_sponsor_expenses(include_void: bool = Query(True)):
+    return await asyncio.to_thread(sponsor_finance_service.list_expenses, include_void=include_void)
+
+
+@router.post(
+    "/admin/sponsor/expenses",
+    response_model=SponsorFundEntryResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def create_sponsor_expense(request: SponsorExpenseRequest):
+    try:
+        return await asyncio.to_thread(sponsor_finance_service.create_expense, request.model_dump())
+    except SponsorFinanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put(
+    "/admin/sponsor/expenses/{entry_id}",
+    response_model=SponsorFundEntryResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def update_sponsor_expense(entry_id: str, request: SponsorExpenseRequest):
+    try:
+        return await asyncio.to_thread(sponsor_finance_service.update_expense, entry_id, request.model_dump())
+    except SponsorFinanceError as exc:
+        status = 404 if exc.code == "not_found" else 409 if exc.code == "void_entry" else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@router.post(
+    "/admin/sponsor/expenses/{entry_id}/void",
+    response_model=SponsorFundEntryResponse,
+    dependencies=ADMIN_ONLY,
+)
+async def void_sponsor_expense(entry_id: str):
+    try:
+        return await asyncio.to_thread(sponsor_finance_service.void_expense, entry_id)
+    except SponsorFinanceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get(
@@ -956,6 +1123,25 @@ async def get_prompt_ram():
     }
 
 
+@router.get("/admin/timing-trace", dependencies=ADMIN_ONLY)
+async def get_timing_trace():
+    """单条弹幕的端到端时序追踪（延迟优化 v1 §2）。
+
+    与 ``reply_timing`` 的分位数互补：分位数说明「哪个阶段慢」，这里说明
+    「这一条为什么慢」——同一条弹幕上的检查点序列，以及 attempt 级耗时与
+    逻辑耗时的差（``overhead_ms``），带回退的一次调用会在这里显示成多条 attempt。
+    ``attention_gate`` 回答的是另一个问题：「这一轮为什么没有回复」——主播主动
+    忽略，还是并发满 / 模型故障 / 输出不可解析导致的让行。
+    不含弹幕正文、昵称与账号；对外只有自增 ``seq``。
+    """
+    return {
+        "trace": timing_trace_recorder.snapshot(),
+        "reply_timing": reply_timing_metrics.snapshot(),
+        "attention_gate": attention_gate_metrics.snapshot(),
+        "ai_routes": ai_service.runtime_diagnostics(),
+    }
+
+
 @router.get("/admin/security/stats", dependencies=ADMIN_ONLY)
 async def get_security_stats():
     """受控的低基数运行指标；不含 IP、账号、昵称、令牌或事件 ID。"""
@@ -987,6 +1173,12 @@ async def get_security_stats():
             "consumer": episodic_memory_consumer.get_stats(),
         },
     }
+
+
+@router.get("/admin/viewer-impression/stats", dependencies=ADMIN_ONLY)
+async def get_viewer_impression_stats():
+    """Viewer Impression 低基数统计；不返回留言正文、账号或 Evidence。"""
+    return await asyncio.to_thread(viewer_impression_service.get_stats)
 
 
 # ==================== Token 审计与管理后台（P29） ====================
@@ -1136,7 +1328,9 @@ async def lifespan(app: FastAPI):
     await sc_consumer.start()
     await stream_session_summary_consumer.start()
     await episodic_memory_consumer.start()
+    await viewer_impression_worker.start()
     await sponsor_sync_worker.start()  # P25 赞助名单同步（纯旁路，默认关闭）
+    await sponsor_finance_sync_worker.start()  # 资金透明同步（独立旁路，默认关闭）
     await token_audit_recorder.start()  # P29 token 记账落库（失败只影响审计自身）
     await event_bus.emit("server_startup")
 
@@ -1146,9 +1340,11 @@ async def lifespan(app: FastAPI):
         StreamLifecycleEvent(phase="ended", source="fastapi_lifespan")
     )
     await sponsor_sync_worker.stop()
+    await sponsor_finance_sync_worker.stop()
     await token_audit_recorder.stop()  # 关服前把队列写完，避免最后几次调用的账丢掉
     await stream_session_summary_consumer.stop()
     await episodic_memory_consumer.stop()
+    await viewer_impression_worker.stop()
     await moderation_coordinator.stop()
     await sc_consumer.stop()
     await persona_event_pipeline.stop()
@@ -1609,6 +1805,8 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                 raise WebSocketDisconnect(code=1009)
             
             try:
+                # 每轮先清掉上一条弹幕的追踪归属，避免这轮的 AI attempt 被算到上一条上。
+                current_trace_id.set(None)
                 message_data = json.loads(data)
                 if not isinstance(message_data, dict):
                     await websocket.send_text(json.dumps({
@@ -1695,6 +1893,10 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                     }, ensure_ascii=False))
                     continue
 
+                # 延迟优化 v1 §2：到达锚点尽量贴近「这条弹幕真正开始被处理」的时刻，
+                # 放在幂等占用之后，避免重复提交把同一条追踪覆盖掉。
+                timing_trace_recorder.start(danmaku_id, path="normal")
+
                 moderation_subject, _, _ = moderation_service.subject_key(
                     viewer_identity, connection.id if connection else "unknown"
                 )
@@ -1719,6 +1921,9 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                     viewer_identity=viewer_identity,
                     client_ip=client_ip,
                 )
+                # 延迟优化 v1 §2：到达锚点。每条弹幕都开一条追踪，只有真正被读到的
+                # 那条会 finish；其余被有界表淘汰并计入 abandoned（顺带就是读取率）。
+                timing_trace_recorder.mark(message_data["danmakuID"], "pool_ready_at")
                 
                 # 记录弹幕到数据库
                 await asyncio.to_thread(
@@ -1855,10 +2060,27 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                     
                     if should_select:
                         logger.debug("开始选择弹幕...")
+                        # 注意力闸门开始时还不知道会选中哪一条，先记住起点，
+                        # 选出结果后再补到那一条的追踪上（§2 attention_ms）。
+                        attention_started = time.perf_counter()
                         selection_result = await danmaku_selector.select_danmaku(available_danmaku)
+                        attention_finished = time.perf_counter()
                         
                         if selection_result and selection_result.selected_danmaku:
                             selected = selection_result.selected_danmaku
+                            # 被真正读到的那一条才继续记时序；ContextVar 让后续
+                            # AIService 的每次 attempt 自动归属到这条弹幕。
+                            timing_trace_recorder.mark_at(
+                                selected.id, "attention_started_at", attention_started
+                            )
+                            timing_trace_recorder.mark_at(
+                                selected.id, "attention_finished_at", attention_finished
+                            )
+                            timing_trace_recorder.note(
+                                selected.id, "candidate_count", len(available_danmaku)
+                            )
+                            trace_id = selected.id
+                            current_trace_id.set(trace_id)
                             
                             # 触发选择事件
                             await event_bus.emit("danmaku_selected", {
@@ -1893,6 +2115,7 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                             )
                             if reply_lease is None:
                                 await danmaku_pool.release_selection(selected.id)
+                                timing_trace_recorder.finish(trace_id, outcome="degraded")
                                 await _send_ws_limit_event(
                                     websocket,
                                     ProtectionDecision(
@@ -1905,6 +2128,7 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                             if not reply_quota.allowed:
                                 await reply_lease.release()
                                 await danmaku_pool.release_selection(selected.id)
+                                timing_trace_recorder.finish(trace_id, outcome="degraded")
                                 await _send_ws_limit_event(
                                     websocket,
                                     reply_quota,
@@ -1971,6 +2195,9 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                         logger.debug(f"回复已记录到数据库")
                                     except Exception as db_error:
                                         logger.error(f"记录回复到数据库时出错: {db_error}")
+                                    timing_trace_recorder.mark(
+                                        trace_id, "reply_record_finished_at"
+                                    )
                                     
                                     # 通过WebSocket推送回复给所有客户端
                                     reply_broadcast = {
@@ -1995,13 +2222,17 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                             path="normal",
                                         )
                                     logger.info("AI回复已广播给所有客户端")
+                                    timing_trace_recorder.mark(trace_id, "broadcast_at")
+                                    timing_trace_recorder.finish(trace_id, outcome="success")
                                 else:
                                     logger.warning("AI回复生成失败，结果为空")
                                     # 即使回复生成失败，也标记为已回复，并存储空回复内容
                                     await danmaku_pool.mark_as_replied(selected.id, "")
+                                    timing_trace_recorder.finish(trace_id, outcome="error")
                                     
                             except Exception as e:
                                 logger.error(f"生成AI回复时出错: {e}")
+                                timing_trace_recorder.finish(trace_id, outcome="error")
                 
             except json.JSONDecodeError:
                 error_response = {

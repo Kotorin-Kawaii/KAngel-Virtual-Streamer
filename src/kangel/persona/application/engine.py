@@ -32,6 +32,7 @@ from .runtime import internal_state_dynamics, persona_dynamics, persona_event_pi
 from kangel.danmaku.application.memory import danmaku_memory_manager
 from kangel.infrastructure.database import db_manager
 from kangel.infrastructure.reply_timing import reply_timing_metrics
+from kangel.infrastructure.timing_trace import mark_current, note_current
 from kangel.danmaku.application.pool import danmaku_pool
 from .emotion_manager import emotion_manager
 from .intent_state import StreamerIntentStateService
@@ -422,6 +423,7 @@ class PersonaEngine:
         try:
             # 获取弹幕记忆上下文
             context_started_at = perf_counter()
+            mark_current("context_started_at")
             logger.debug(f"[DEBUG] 开始获取记忆上下文...")
             memory_context = await danmaku_memory_manager.get_memory_context(limit=10)
             logger.debug(f"[DEBUG] 记忆上下文获取完成")
@@ -564,10 +566,14 @@ class PersonaEngine:
                 "context", (perf_counter() - context_started_at) * 1000,
                 path=reply_path,
             )
+            mark_current("context_finished_at")
 
             # QA 只为最终回复提供人设证据；情感分析使用完整人格、当前状态与
             # 已核验的直接上下文，两者不再互相等待。
             if conversation_context and conversation_context.get("depends_on_previous"):
+                # 三条分支各自标注：没有它，快照里「缺 qa_ms」既可能是跳过、
+                # 也可能是失败，无法区分。
+                note_current("stage_mode", "qa_skipped")
                 retrieved_qa = []
                 reply_timing_metrics.record(
                     "qa_selection", 0, path=reply_path,
@@ -578,6 +584,7 @@ class PersonaEngine:
                     danmaku_message.get('message', '')[:40],
                 )
                 impact_started_at = perf_counter()
+                mark_current("impact_started_at")
                 try:
                     analysis = await persona_impact_analyzer.analyze_danmaku_impact(
                         danmaku_message.get('message', ''),
@@ -587,20 +594,25 @@ class PersonaEngine:
                         **impact_scene_context,
                     )
                 finally:
+                    mark_current("impact_finished_at")
                     reply_timing_metrics.record(
                         "impact_analysis", (perf_counter() - impact_started_at) * 1000,
                         path=reply_path, model_role="impact",
                     )
             elif settings.ai.parallel_context_analysis:
+                note_current("stage_mode", "parallel")
                 parallel_started = perf_counter()
+                mark_current("parallel_started_at")
                 async def timed_qa():
                     started_at = perf_counter()
+                    mark_current("qa_started_at")
                     try:
                         return await persona_qa_selector.select(
                             danmaku_message.get('message', ''), self.state,
                             top_k=3, conversation_context=conversation_context,
                         )
                     finally:
+                        mark_current("qa_finished_at")
                         reply_timing_metrics.record(
                             "qa_selection", (perf_counter() - started_at) * 1000,
                             path=reply_path, model_role="qa",
@@ -608,6 +620,7 @@ class PersonaEngine:
 
                 async def timed_impact():
                     started_at = perf_counter()
+                    mark_current("impact_started_at")
                     try:
                         return await persona_impact_analyzer.analyze_danmaku_impact(
                             danmaku_message.get('message', ''), self.state,
@@ -615,6 +628,7 @@ class PersonaEngine:
                             **impact_scene_context,
                         )
                     finally:
+                        mark_current("impact_finished_at")
                         reply_timing_metrics.record(
                             "impact_analysis", (perf_counter() - started_at) * 1000,
                             path=reply_path, model_role="impact",
@@ -623,23 +637,28 @@ class PersonaEngine:
                 retrieved_qa, analysis = await asyncio.gather(
                     timed_qa(), timed_impact(),
                 )
+                mark_current("parallel_finished_at")
                 logger.info(
                     "QA选择与情感影响并行完成，关键路径耗时=%dms",
                     round((perf_counter() - parallel_started) * 1000),
                 )
             else:
+                note_current("stage_mode", "serial")
                 qa_started_at = perf_counter()
+                mark_current("qa_started_at")
                 try:
                     retrieved_qa = await persona_qa_selector.select(
                         danmaku_message.get('message', ''), self.state,
                         top_k=3, conversation_context=conversation_context,
                     )
                 finally:
+                    mark_current("qa_finished_at")
                     reply_timing_metrics.record(
                         "qa_selection", (perf_counter() - qa_started_at) * 1000,
                         path=reply_path, model_role="qa",
                     )
                 impact_started_at = perf_counter()
+                mark_current("impact_started_at")
                 try:
                     analysis = await persona_impact_analyzer.analyze_danmaku_impact(
                         danmaku_message.get('message', ''), self.state,
@@ -647,12 +666,17 @@ class PersonaEngine:
                         **impact_scene_context,
                     )
                 finally:
+                    mark_current("impact_finished_at")
                     reply_timing_metrics.record(
                         "impact_analysis", (perf_counter() - impact_started_at) * 1000,
                         path=reply_path, model_role="impact",
                     )
 
             # 在生成回复前只分析一次当前弹幕，用投影状态指导本轮即时反应。
+            # §4 需要「空召回占比」的线上口径，所以这里顺手记条数（不记内容）。
+            note_current("qa_hits", len(retrieved_qa or []))
+            # §5 要能看出这一条的评价是模型给的还是掉进了本地兜底。
+            note_current("appraisal_source", getattr(analysis, "appraisal_source", "none"))
             reaction_state = self.state.model_copy(deep=True)
             reaction_internal_state = self.internal_state.model_copy(deep=True)
             if analysis:
@@ -740,6 +764,7 @@ class PersonaEngine:
             
             logger.debug(f"[DEBUG] 开始生成提示词...")
             prompt_started_at = perf_counter()
+            mark_current("prompt_started_at")
             prompt_kwargs = dict(
                 additional_context=danmaku_message.get('message', ''),
                 persona_state=current_persona_state,
@@ -786,6 +811,7 @@ class PersonaEngine:
                     persona_prompt_metrics.record("shadow_build_failed")
                     logger.exception("Catalog Shadow 构建失败；Legacy 回复继续")
             persona_prompt_metrics.record(f"prompt_mode_{active_prompt_mode}")
+            mark_current("prompt_finished_at")
             reply_timing_metrics.record(
                 "prompt_build", (perf_counter() - prompt_started_at) * 1000,
                 path=reply_path,
@@ -795,6 +821,7 @@ class PersonaEngine:
             logger.info(f"开始生成回复，弹幕: {danmaku_message.get('message', '')[:30]}...")
             
             reply_model_started_at = perf_counter()
+            mark_current("reply_llm_started_at")
             try:
                 result = await self.ai_service.run(
                     messages=messages,
@@ -804,6 +831,7 @@ class PersonaEngine:
                     response_format=response_format
                 )
             finally:
+                mark_current("reply_llm_finished_at")
                 reply_timing_metrics.record(
                     "reply_model", (perf_counter() - reply_model_started_at) * 1000,
                     path=reply_path, model_role="reply",
@@ -883,6 +911,7 @@ class PersonaEngine:
                 reaction_state.stress,
                 reaction_state.darkness,
             )
+            mark_current("validation_finished_at")
             reply_timing_metrics.record(
                 "output_validation", (perf_counter() - validation_started_at) * 1000,
                 path=reply_path,
@@ -901,6 +930,9 @@ class PersonaEngine:
                     stream_session_id=str(claim_stream_session_id) if claim_stream_session_id else None,
                 )
                 self._log_impact_analysis(danmaku_message.get('message', ''), analysis)
+            # 人格提交与记忆提交分开记：§2 要求能分别看到两段提交的耗时，
+            # 也顺便证明提交顺序（人格 → 记忆）没有被并行打乱。
+            mark_current("persona_commit_finished_at")
             if reply_data and not is_moderation_response:
                 long_term_memory_recorded = self._record_long_term_exchange(
                     danmaku_message,
@@ -960,6 +992,7 @@ class PersonaEngine:
                     )
                 except Exception as exc:
                     logger.warning("采集 P30 工作记忆失败: %s", exc)
+            mark_current("memory_commit_finished_at")
             reply_timing_metrics.record(
                 "state_commit", (perf_counter() - commit_started_at) * 1000,
                 path=reply_path,

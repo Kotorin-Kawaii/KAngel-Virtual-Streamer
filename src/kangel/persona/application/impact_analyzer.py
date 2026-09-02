@@ -26,21 +26,21 @@ class ImpactAnalysis:
     current_mood: float
     current_stress: float
     current_darkness: float
-
+    
     # 分析维度
     emotional_tone: str  # 情感倾向: positive, negative, neutral, mixed
     content_intensity: float  # 内容强度 0-1
     context_relevance: float  # 上下文相关性 0-1
-
+    
     # 影响评估
     mood_impact: float
     stress_impact: float
     darkness_impact: float
-
+    
     # 仅为旧扩展的输入兼容保留；不再进入日志、历史或持久化。
     reasoning: str
     key_factors: List[str]  # 关键影响因素
-
+    
     # 边界控制
     clamped_mood: float
     clamped_stress: float
@@ -51,9 +51,9 @@ class ImpactAnalysis:
         EventTriggerClass.NEUTRAL_INTERACTION, 0.0, 0.0, 0.0, 0.0, 0.0,
     ))
     appraisal_source: str = "legacy"
-
+    
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-
+    
     def to_dict(self) -> dict:
         payload = asdict(self)
         payload.pop("danmaku_content", None)
@@ -64,12 +64,12 @@ class ImpactAnalysis:
 
 class PersonaImpactAnalyzer:
     """人格影响分析器"""
-
+    
     def __init__(self):
         self._analysis_history: List[ImpactAnalysis] = []
         self._max_history = 50
         self._lock = asyncio.Lock()
-
+        
         # 边界控制参数
         self._max_single_change = 0.15  # 单次最大变化
         self._min_mood = 0.05  # 最低心情值
@@ -78,18 +78,18 @@ class PersonaImpactAnalyzer:
         self._max_stress = 0.95
         self._min_darkness = 0.0
         self._max_darkness = 0.9
-
+        
         # 调试模式
         self._debug_mode = True
-
+    
     def set_debug_mode(self, enabled: bool):
         """设置调试模式"""
         self._debug_mode = enabled
         logger.info(f"人格影响分析器调试模式: {'启用' if enabled else '禁用'}")
-
+    
     async def analyze_danmaku_impact(
-        self,
-        danmaku_content: str,
+        self, 
+        danmaku_content: str, 
         current_state: PersonaState,
         retrieved_qa: Optional[List[Dict]] = None,
         conversation_context: Optional[Dict] = None,
@@ -113,9 +113,9 @@ class PersonaImpactAnalyzer:
                 room_context=room_context,
                 relationship_boundary=relationship_boundary,
             )
-
+            
             logger.debug("开始分析弹幕影响")
-
+            
             result = await ai_service.run(
                 messages=messages,
                 role="impact_analysis",
@@ -124,29 +124,29 @@ class PersonaImpactAnalyzer:
                 temperature=0.3,
                 timeout=settings.ai.impact_analysis_timeout,
             )
-
+            
             analysis_text = result.get('reply', '')
-
+            
             if analysis_text:
                 # 清理JSON标记
                 cleaned_text = self._clean_json_text(analysis_text)
-
+                
                 try:
                     analysis_data = json.loads(cleaned_text)
                     analysis = self._parse_analysis_result(
-                        analysis_data,
-                        danmaku_content,
+                        analysis_data, 
+                        danmaku_content, 
                         current_state
                     )
-
+                    
                     # 保存分析历史
                     await self._save_analysis(analysis)
-
+                    
                     if self._debug_mode:
                         logger.info(f"弹幕影响分析完成: {json.dumps(analysis.to_dict(), ensure_ascii=False)}")
-
+                    
                     return analysis
-
+                    
                 except json.JSONDecodeError as e:
                     logger.error(f"解析分析结果失败: {e}")
                     logger.warning("影响分析响应不是有效 JSON，使用安全回退")
@@ -154,17 +154,17 @@ class PersonaImpactAnalyzer:
                     return await self._fallback_analysis(
                         danmaku_content, current_state, conversation_context
                     )
-
+            
             return await self._fallback_analysis(
                 danmaku_content, current_state, conversation_context
             )
-
+            
         except Exception as e:
             logger.error(f"弹幕影响分析出错: {e}")
             return await self._fallback_analysis(
                 danmaku_content, current_state, conversation_context
             )
-
+    
     def _build_analysis_prompt(
         self,
         danmaku_content: str,
@@ -176,10 +176,10 @@ class PersonaImpactAnalyzer:
         relationship_boundary: Optional[Dict] = None,
     ) -> List[Dict[str, str]]:
         """构建分析提示词，包含主播的完整人格设定和RAG检索的QA参考"""
-
+        
         # 获取系统提示词
         system_prompt = streamer_reply_prompt_builder._build_system_prompt()
-
+        
         qa_reference = streamer_reply_prompt_builder._format_retrieved_qa(retrieved_qa or [])
         qa_reference_section = (
             f"【相关人设QA参考】\n{qa_reference}\n" if qa_reference else ""
@@ -192,7 +192,7 @@ class PersonaImpactAnalyzer:
             room_context=room_context,
             relationship_boundary=relationship_boundary,
         )
-
+        
         if settings.ai.event_appraisal_enabled:
             impact_fields_instruction = """4. 事件评价（event_appraisal）：只输出受限字段，不要输出推理过程。`trigger_class` 只能是 affirmation/cooperative_response/distress_share/pressure_or_demand/boundary_challenge/activity_progress/neutral_interaction；reward_or_threat、affiliation、agency_or_pressure、novelty 取 -1 到 1；confidence 取 0 到 1
 5. 关键影响类别（key_factors）：至多 3 个，只能从 affirmation/affiliation/cooperation/distress/pressure/boundary/activity/novelty/neutral 中选择"""
@@ -256,7 +256,7 @@ class PersonaImpactAnalyzer:
 }}
 
 注意：影响值应该是相对温和的变化，避免极端值。"""
-
+        
         return [
             {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": user_prompt.strip()}
@@ -298,38 +298,38 @@ class PersonaImpactAnalyzer:
             f"- 未闭合期待: {awaiting}\n"
             f"- 已验证关系边界: {boundary}"
         )
-
+    
     def _clean_json_text(self, text: str) -> str:
         """清理JSON文本"""
         cleaned = text.strip()
-
+        
         # 移除 ```json 开头
         if cleaned.startswith('```json'):
             cleaned = cleaned[7:]
         elif cleaned.startswith('```'):
             cleaned = cleaned[3:]
-
+        
         # 移除结尾的 ```
         if cleaned.endswith('```'):
             cleaned = cleaned[:-3]
-
+        
         return cleaned.strip()
-
+    
     def _parse_analysis_result(
-        self,
-        data: dict,
-        danmaku_content: str,
+        self, 
+        data: dict, 
+        danmaku_content: str, 
         current_state: PersonaState
     ) -> ImpactAnalysis:
         """解析AI分析结果"""
-
+        
         # 提取并验证各项值
         emotional_tone = str(data.get('emotional_tone', 'neutral'))
         if emotional_tone not in {'positive', 'negative', 'neutral', 'mixed'}:
             emotional_tone = 'neutral'
         content_intensity = self._bounded_float(data.get('content_intensity'), 0.5, 0.0, 1.0)
         context_relevance = self._bounded_float(data.get('context_relevance'), 0.5, 0.0, 1.0)
-
+        
         # 旧响应仍可使用既有增量；含有效结构化评价的新响应由后端投影，
         # 不接受模型直接指定三轴结果。
         raw_mood_impact = self._bounded_float(
@@ -363,7 +363,7 @@ class PersonaImpactAnalyzer:
             mood_impact, stress_impact, darkness_impact = (
                 raw_mood_impact, raw_stress_impact, raw_darkness_impact,
             )
-
+        
         # 根据当前状态动态调整影响权重（传入属性名称以便特殊处理）
         mood_impact = self._adjust_impact_by_current_state(
             mood_impact, current_state.mood, self._min_mood, self._max_mood, "mood"
@@ -374,18 +374,18 @@ class PersonaImpactAnalyzer:
         darkness_impact = self._adjust_impact_by_current_state(
             darkness_impact, current_state.darkness, self._min_darkness, self._max_darkness, "darkness"
         )
-
+        
         # 计算边界控制后的新值
-        clamped_mood = max(self._min_mood,
-                          min(self._max_mood,
+        clamped_mood = max(self._min_mood, 
+                          min(self._max_mood, 
                               current_state.mood + mood_impact))
-        clamped_stress = max(self._min_stress,
-                            min(self._max_stress,
+        clamped_stress = max(self._min_stress, 
+                            min(self._max_stress, 
                                 current_state.stress + stress_impact))
-        clamped_darkness = max(self._min_darkness,
-                              min(self._max_darkness,
+        clamped_darkness = max(self._min_darkness, 
+                              min(self._max_darkness, 
                                   current_state.darkness + darkness_impact))
-
+        
         # 兼容仍会返回 reasoning 的旧模型，但绝不采纳、记录或持久化该自由文本。
         reasoning = ""
         key_factors = (
@@ -393,7 +393,7 @@ class PersonaImpactAnalyzer:
             if settings.ai.event_appraisal_enabled
             else self._bounded_key_factors(data.get('key_factors'))
         )
-
+        
         return ImpactAnalysis(
             danmaku_content=danmaku_content,
             current_mood=current_state.mood,
@@ -474,18 +474,18 @@ class PersonaImpactAnalyzer:
             novelty=max(-1.0, min(1.0, intensity * 2 - 1)),
             confidence=0.35,
         )
-
+    
     def _adjust_impact_by_current_state(
-        self,
-        impact: float,
-        current_value: float,
-        min_value: float,
+        self, 
+        impact: float, 
+        current_value: float, 
+        min_value: float, 
         max_value: float,
         attribute_name: str = "unknown"
     ) -> float:
         """
         根据当前状态动态调整影响值
-
+        
         约束策略：
         1. 接近物理边界时，同向影响衰减
         2. 仅在极端边界附近提供很弱的安全回归，不把中度低落/高压自动拉回乐观值
@@ -493,7 +493,7 @@ class PersonaImpactAnalyzer:
         # 计算距离边界的距离
         distance_to_max = max_value - current_value
         distance_to_min = current_value - min_value
-
+        
         # 1. 边界衰减：接近边界时，同向影响减弱
         if impact > 0:
             # 正向影响：距离上限越近，影响越小
@@ -506,7 +506,7 @@ class PersonaImpactAnalyzer:
             if distance_to_min < 0.3:
                 decay_factor = (distance_to_min / 0.3) ** 2
                 impact = impact * decay_factor
-
+        
         # 2. 回归均值仅作为接近极端边界时的安全保护。
         # 计算偏离中间值的程度 (0=中间, 1=边界)
         mid_value = (min_value + max_value) / 2
@@ -532,12 +532,12 @@ class PersonaImpactAnalyzer:
             impact *= multiplier
         elif attribute_name == "mood" and impact > 0 and current_value <= tuning.extreme_guard_mood_floor:
             impact *= multiplier
-
+        
         return impact
-
+    
     async def _fallback_analysis(
-        self,
-        danmaku_content: str,
+        self, 
+        danmaku_content: str, 
         current_state: PersonaState,
         conversation_context: Optional[Dict] = None,
     ) -> ImpactAnalysis:
@@ -546,18 +546,18 @@ class PersonaImpactAnalyzer:
         使用关键词匹配进行基础分析
         """
         logger.warning("使用回退分析方法")
-
+        
         danmaku_lower = danmaku_content.lower()
-
+        
         # 关键词匹配
         positive_keywords = ['好棒', '喜欢', '爱', '超棒', '可爱', '加油', '支持', '好听', '厉害', '优秀', '棒']
         negative_keywords = ['不好', '讨厌', '失望', '难过', '伤心', '生气', '无聊', '差', '烂', '垃圾']
         dark_keywords = ['黑暗', '痛苦', '绝望', '孤独', '死亡', '意义', '虚无', '自杀', '抑郁', '焦虑']
-
+        
         positive_count = sum(1 for kw in positive_keywords if kw in danmaku_lower)
         negative_count = sum(1 for kw in negative_keywords if kw in danmaku_lower)
         dark_count = sum(1 for kw in dark_keywords if kw in danmaku_lower)
-
+        
         # 计算基础影响
         mood_impact = (positive_count * 0.03) - (negative_count * 0.03)
         stress_impact = -(positive_count * 0.02) + (negative_count * 0.02)
@@ -573,7 +573,7 @@ class PersonaImpactAnalyzer:
         if cooperative_completion:
             mood_impact += 0.03
             stress_impact -= 0.03
-
+        
         # 确定情感倾向
         if cooperative_completion:
             emotional_tone = "positive"
@@ -583,17 +583,17 @@ class PersonaImpactAnalyzer:
             emotional_tone = "negative"
         else:
             emotional_tone = "neutral"
-
+        
         # 内容强度
         content_intensity = min((positive_count + negative_count + dark_count) * 0.1, 1.0)
         if cooperative_completion:
             content_intensity = max(content_intensity, 0.3)
-
+        
         # 应用边界控制
         mood_impact = max(-self._max_single_change, min(self._max_single_change, mood_impact))
         stress_impact = max(-self._max_single_change, min(self._max_single_change, stress_impact))
         darkness_impact = max(-self._max_single_change, min(self._max_single_change, darkness_impact))
-
+        
         # 动态调整（传入属性名称以便特殊处理）
         mood_impact = self._adjust_impact_by_current_state(
             mood_impact, current_state.mood, self._min_mood, self._max_mood, "mood"
@@ -604,11 +604,11 @@ class PersonaImpactAnalyzer:
         darkness_impact = self._adjust_impact_by_current_state(
             darkness_impact, current_state.darkness, self._min_darkness, self._max_darkness, "darkness"
         )
-
+        
         clamped_mood = max(self._min_mood, min(self._max_mood, current_state.mood + mood_impact))
         clamped_stress = max(self._min_stress, min(self._max_stress, current_state.stress + stress_impact))
         clamped_darkness = max(self._min_darkness, min(self._max_darkness, current_state.darkness + darkness_impact))
-
+        
         key_factors = []
         if positive_count > 0:
             key_factors.append("积极关键词")
@@ -622,7 +622,7 @@ class PersonaImpactAnalyzer:
             key_factors = ["承接上一轮主播互动", "观众积极配合"] + [
                 factor for factor in key_factors if factor != "中性内容"
             ]
-
+        
         return ImpactAnalysis(
             danmaku_content=danmaku_content,
             current_mood=current_state.mood,
@@ -654,7 +654,7 @@ class PersonaImpactAnalyzer:
             ),
             appraisal_source="fallback",
         )
-
+    
     async def _save_analysis(self, analysis: ImpactAnalysis):
         """只保留受限结构化诊断；不留弹幕原文或模型自由文本。"""
         async with self._lock:
@@ -663,11 +663,11 @@ class PersonaImpactAnalyzer:
             ))
             if len(self._analysis_history) > self._max_history:
                 self._analysis_history.pop(0)
-
+    
     def get_analysis_history(self, limit: int = 10) -> List[dict]:
         """获取分析历史"""
         return [a.to_dict() for a in self._analysis_history[-limit:]]
-
+    
     def get_emotion_delta(self, analysis: ImpactAnalysis) -> EmotionDelta:
         """从分析结果获取情绪变化对象"""
         return EmotionDelta(
@@ -675,7 +675,7 @@ class PersonaImpactAnalyzer:
             stress=analysis.stress_impact,
             darkness=analysis.darkness_impact
         )
-
+    
     def apply_analysis_to_state(self, analysis: ImpactAnalysis, current_state: PersonaState) -> PersonaState:
         """应用分析结果到人格状态"""
         return PersonaState(
@@ -683,7 +683,7 @@ class PersonaImpactAnalyzer:
             stress=analysis.clamped_stress,
             darkness=analysis.clamped_darkness
         )
-
+    
     def get_debug_info(self) -> dict:
         """获取调试信息"""
         return {

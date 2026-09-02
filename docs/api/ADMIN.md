@@ -179,7 +179,7 @@ curl -s -H "x-admin-key: $ADMIN_KEY" http://localhost:8000/config | grep -i "api
 全部需要管理密钥，全部在后台里有对应面板。
 
 **概览与配置**：`GET /admin/overview`、`GET /config`、`GET /connections`、
-`GET /admin/security/stats`
+`GET /admin/security/stats`、`GET /admin/timing-trace`
 
 **Token 审计**：`GET /admin/tokens/{daily,breakdown,records,stats}`
 
@@ -198,7 +198,8 @@ curl -s -H "x-admin-key: $ADMIN_KEY" http://localhost:8000/config | grep -i "api
 
 **表情**：`GET /admin/emotes/stats`
 
-**赞助**：`GET /admin/sponsor/stats`
+**赞助**：`GET /admin/sponsor/stats`、`GET /admin/sponsor/finance/stats`、
+`GET /admin/sponsor/expenses`
 
 **数据库**：`GET /database/{stats,danmaku,replies,export}`
 
@@ -216,6 +217,18 @@ curl -s -H "x-admin-key: $ADMIN_KEY" http://localhost:8000/config | grep -i "api
 | POST | `/emotion/select`（`mood`/`stress`/`darkness`/`count`） |
 | POST | `/persona/impact/debug-mode`（`enabled`） |
 | POST | `/persona/impact/analyze`（JSON body `content`） |
+| POST | `/admin/sponsor/finance/sync`（触发有界收入同步） |
+| POST | `/admin/sponsor/expenses`（JSON 支出记录） |
+| PUT | `/admin/sponsor/expenses/{entry_id}`（编辑 active 记录） |
+| POST | `/admin/sponsor/expenses/{entry_id}/void`（作废，不删除） |
+
+首次上线或更换爱发电凭据后，可在服务端运行一次受控 smoke（必须显式确认真实请求）：
+
+```bash
+uv run python scripts/smoke_afdian_orders.py --allow-live
+```
+
+脚本只输出订单字段存在性和条数，不输出订单号、金额、用户字段、时间戳、响应原文，且不写入数据库。
 
 **刻意排除**（后台只以禁用状态列出并注明「请用 curl 执行」）：
 
@@ -248,6 +261,76 @@ TTL 是否合适、消毒有没有误杀，都看 `stats` 与 `note`）。
 `PROMPT_RAM__ENABLED=false` 时接口仍在，返回 `enabled: false` 且
 `entries` 为空。契约由 `tests/contract/test_admin_dashboard.py` 钉住顶层
 字段集合 `{enabled, stats, entries}`。
+
+### 6.3 `GET /admin/timing-trace`（延迟优化 v1 §2 时序追踪）
+
+分位数说明「哪个阶段慢」，这个接口补上「这一条为什么慢」：同一条弹幕上的
+检查点序列，以及 **attempt 级耗时与逻辑耗时之差**。一次带供应商回退的逻辑
+调用会在这里显示成多条 attempt，`overhead_ms = logical_ms - attempt_ms`
+就是本地等待与回退的成本 —— 把 API attempt 当业务请求数是被明确禁止的口径。
+
+```json
+{
+  "trace": {
+    "recent": [
+      {"seq": 41, "path": "normal", "outcome": "success",
+       "checkpoints": ["received_at", "attention_started_at", "…"],
+       "derived": {"attention_ms": 4210, "qa_ms": 2830, "impact_ms": 4996,
+                   "parallel_context_critical_path_ms": 5010,
+                   "reply_llm_ms": 6980, "read_to_reply_ms": 15870,
+                   "arrival_to_reply_ms": 21050},
+       "attempts_by_role": {"reply": {"attempts": 2, "failed": 1,
+                                      "attempt_ms": 6100, "logical_ms": 6980,
+                                      "overhead_ms": 880}},
+       "attempt_total": 3,
+       "notes": {"stage_mode": "parallel", "qa_hits": 0,
+                 "appraisal_source": "model"}}
+    ],
+    "open_traces": 1,
+    "stats": {"started": 42, "completed": 41, "abandoned": 0, "dropped": 0},
+    "capacity": {"max_open": 128, "max_completed": 64},
+    "sample_policy": {"identifier": "自增 seq；原始 danmaku_id 只写 DEBUG 日志",
+                      "excludes": ["message", "account_id", "nickname", "ip", "prompt"]}
+  },
+  "reply_timing": { "…": "分位数，键形如 stage:path:outcome:model_role" },
+  "attention_gate": {
+    "counts": {"selected": 37, "ignored_by_attention": 5,
+               "deferred_due_to_capacity": 0, "deferred_due_to_model_failure": 2,
+               "deferred_due_to_invalid_output": 1, "deferred_due_to_local_error": 0},
+    "autonomous_decisions": 42, "deferrals": 3, "ignore_rate": 0.119,
+    "candidates_seen": 118, "last_outcome": "selected",
+    "policy": {"on_saturation": "defer", "on_model_failure": "defer",
+               "on_invalid_output": "defer",
+               "note": "DEFER 不 claim、不标记已回复、不删除候选，也不计入 ignore_rate"}
+  },
+  "ai_routes": { "…": "runtime_diagnostics()：每个角色实际走了哪个供应商与模型" }
+}
+```
+
+口径与纪律：
+
+- `attention_gate` 回答的是另一个问题：**「这一轮为什么没有回复」**。
+  `ignored_by_attention` 是主播**主动**决定谁都不读（有语义价值的自主决策）；
+  四个 `deferred_*` 是系统状况导致的让行（并发满 / 模型全部失败 / 输出不可解析 /
+  本地异常）。**把让行记成主动忽略等于把故障伪装成主播的性格**，所以
+  `ignore_rate` 的分母只算 `autonomous_decisions`，不含让行 —— 否则供应商
+  报 401 时忽略率会自己漂移，那个数就不可读了。让行**不 claim、不标记已回复、
+  不删除候选**，候选在后续 tick 仍会重新进入判定。
+
+- **只有真正被读过的弹幕才开追踪**；SC 是必读路径（没有注意力闸门），
+  所以 `path="sc"` 的条目**不产出** `read_to_reply_ms`，
+  `arrival_to_reply_ms` 才是它的端到端口径。
+- 缺一端或倒序的窗口**一律不产出**该派生项，绝不猜数字。
+- **不含正文**：对外只有自增 `seq`，弹幕标识只写 DEBUG 日志；
+  昵称、账号、IP、prompt 全部不进追踪。
+- 有界：最多 128 条在途、64 条已完成；被淘汰的在途条目计入 `abandoned`。
+- **观测失败只丢这一条追踪**，所有公开方法吞异常，绝不影响回复链路。
+- 派生指标只把 engine/routes **尚未** `record` 的 6 个序列喂给
+  `reply_timing`（attention、parallel_context_critical_path、memory_commit、
+  reply_record、read_to_reply、arrival_to_reply），避免同一次调用在分位数里
+  出现两次；attempt 走独立的 `api_attempt:*` 序列，不与阶段分位数混算。
+
+后台面板：「安全与限流 → 端到端时序追踪」。
 
 ## 7. 上线顺序
 

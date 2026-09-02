@@ -74,6 +74,7 @@ class AccountMemoryGovernanceService:
             self._public_episodic(item)
             for item in self.database.list_account_episodic_memories(account_id, limit=1000)
         ]
+        snapshot["viewer_impression"] = self.database.list_account_viewer_impression_export(account_id)
         for item in snapshot["nickname_history"]:
             item["is_current"] = bool(item["is_current"])
             item.pop("mention_presented_at", None)

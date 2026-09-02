@@ -2,7 +2,7 @@
 
 本文档面向前端开发 agent，覆盖当前后端全部 HTTP 路由、WebSocket 收发事件、认证方式、字段类型、状态码和接入时序。
 
-> 对应 v0.3.0 后端状态：2026-08-31。WebSocket 事件的权威清单见 [`WEBSOCKET_EVENTS.md`](WEBSOCKET_EVENTS.md)；本文保留字段类型、HTTP 契约与接入细节。
+> 对应后端状态：2026-08-10。WebSocket 事件的权威清单见 [`WEBSOCKET_EVENTS.md`](WEBSOCKET_EVENTS.md)；本文保留字段类型、HTTP 契约与接入细节。
 
 ## 1. 基础约定
 
@@ -23,7 +23,7 @@ Swagger UI：http://localhost:8000/docs
 AUTH__COOKIE_SECURE=true
 ```
 
-跨域部署时，后端 `CORS__ALLOWED_ORIGINS` 必须包含前端的精确 Origin（协议、域名和端口），例如 `https://frontend.example.com`。前端请求认证接口时设置 `credentials: "include"`；服务端允许凭据，因此不会接受 `*` 来源。请将示例域名替换为你自己的前端 Origin。
+跨域部署时，后端 `CORS__ALLOWED_ORIGINS` 必须包含前端的精确 Origin（协议、域名和端口），例如 `https://kangel.kotorin.cn`。前端请求认证接口时设置 `credentials: "include"`；服务端允许凭据，因此不会接受 `*` 来源。
 
 当前 GitHub Pages 前端是跨站部署，登录 Cookie 使用 `HttpOnly; Secure; SameSite=None; Partitioned`（CHIPS）。`AUTH__COOKIE_DOMAIN` 默认留空，Cookie 只发送回 API 域名且按顶级站点分区；不要由前端读取或复制令牌。
 
@@ -138,7 +138,7 @@ WebSocket 按以下顺序取令牌：
 const ws = new WebSocket("ws://localhost:8000/danmaku");
 ```
 
-没有令牌时作为游客连接；携带无效或过期令牌时也会安全降级为游客。需要恢复登录身份时，应先按上文流程刷新 HTTP 会话，再关闭旧连接并重新建立 WebSocket。
+没有令牌时作为游客连接；携带无效或过期令牌时不会降级为游客，而是以 WebSocket 关闭码 `1008` 拒绝。
 
 ## 4. 产品核心 HTTP 接口
 
@@ -786,6 +786,48 @@ type SponsorListResponse = {
 为「暂时读不到」设计特殊状态，按普通网络错误提示并允许重试即可。此链路是纯旁路，
 任何失败都不影响弹幕、SC、AI 回复与鉴权。
 
+### 4.23 Sponsor Fund Transparency
+
+`GET /sponsor/transparency`，无需登录。该接口由 `SPONSOR__TRANSPARENCY_ENABLED` 独立控制，
+关闭时返回 `enabled=false` 与空月份；不会关闭或改变感谢墙。收入只来自爱发电成功订单同步，
+支出由维护者在管理接口登记，保存/编辑/作废后下一次请求即可看到，无需重启或重新构建前端。
+
+```ts
+type SponsorTransparencyResponse = {
+  enabled: boolean;
+  currency: "CNY";
+  received_total_cents: number;
+  spent_total_cents: number;
+  remaining_cents: number;
+  supporter_count: number;
+  updated_at: ISODateTime | null;
+  months: {
+    month: string; // YYYY-MM
+    opening_balance_cents: number;
+    received_cents: number;
+    spent_cents: number;
+    closing_balance_cents: number;
+    expenses: { category: string; title: string; amount_cents: number; note: string | null }[];
+  }[];
+};
+```
+
+公开金额全部是项目聚合口径，不可关联到具体赞助者。响应永远不包含 `order_key`、订单号、
+平台用户 ID、昵称、订单备注或支付信息。公开文案应说明：收入数据自动同步自爱发电成功订单，
+资金用途由项目维护者手动登记。透明数据失败时只隐藏资金区，感谢墙、赞助入口和直播主链继续可用。
+
+管理端（均需 `x-admin-key`）新增：
+
+- `GET /admin/sponsor/finance/stats`
+- `POST /admin/sponsor/finance/sync`
+- `GET /admin/sponsor/expenses?include_void=true`
+- `POST /admin/sponsor/expenses`
+- `PUT /admin/sponsor/expenses/{entry_id}`
+- `POST /admin/sponsor/expenses/{entry_id}/void`
+
+支出金额使用整数分，类别固定为 `ai_api`、`server`、`network`、`domain`、`cdn`、`software`、
+`hardware`、`other`；后台不提供人工修改收入总额，错误支出只能作废而不能删除。
+
 ## 5. WebSocket `/danmaku`
 
 ### 5.1 客户端发送弹幕
@@ -1338,7 +1380,7 @@ ws.onmessage = (event) => {
 
 建议前端实现带抖动的指数退避重连：
 
-- 失效令牌不会触发专用 WebSocket 关闭码，而是以游客身份继续连接；登录态恢复由 HTTP `401`/refresh 流程负责。
+- `1008`：令牌无效，停止自动重连并要求重新登录。
 - `1009`：发送帧过大，修正负载后由用户重新连接，不要原样重发。
 - `1013`：握手频率、连接数或服务容量受限，至少等待上次已知 `retry_after_seconds`，未知时从 2 秒开始退避。
 - `1001`：服务端优雅关闭。默认配置不会再因 120 秒没有客户端入站消息而关闭连接；只有运维显式启用应用层空闲超时/最大生命周期时才可能用于连接回收。
@@ -1902,7 +1944,7 @@ stores/chat.ts          Danmaku 与 AIReply，按 danmakuID 关联
 - `ai_reply` 先判 `data.source`：`stream_director` 变体没有 `danmaku_id`/`nickname`/`original_message`。
 - 主线字段（`session_theme`、`daily_stream_plan`、`current_mainline_beat`）可能整段为 `null`，按功能未开启处理。
 - `stream_mainline_beat` 与 `streamer_beat`/`streamer_activity` 各有独立的 `version`，不可互相比较。
-- 仅 HTTP `401`（refresh 失败且 profile 重试仍失败）进入重新登录流程；WebSocket 失效令牌会降级为游客。
+- `401` 和 WebSocket `1008` 进入重新登录流程。
 - 所有 `extra` 和动态调试字段都按未知扩展字段处理。
 - 不将 `client_ip`、Token、API Key、数据库导出内容送往日志和埋点。
 

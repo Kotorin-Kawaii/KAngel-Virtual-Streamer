@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from config import settings
 from kangel.shared.logging import logger
 from .pool import DanmakuPool, DanmakuItem, danmaku_pool
+from .attention_metrics import AttentionOutcome, attention_gate_metrics
 from kangel.persona.application.engine import PersonaEngine, persona_engine
 from kangel.persona.application.prompt_ram import prompt_ram_service
 from kangel.stream.application.metadata import stream_metadata_pusher
@@ -29,6 +30,54 @@ class SelectionResult:
     selection_reason: str
     confidence_score: float
     processing_time_ms: float
+
+
+@dataclass(frozen=True)
+class AttentionDecision:
+    """注意力闸门一次判定的结果。
+
+    只有 ``SELECTED`` 才带候选。其余情形都返回 ``selected is None``，但
+    **原因不能被混成一件事**：``IGNORED`` 是主播自己决定这一轮谁都不读，
+    四种 ``DEFERRED_*`` 是系统状况（并发满、模型故障、输出不可解析、本地异常）
+    导致的让行。让行不 claim、不标记已回复、不删除候选，后续 tick 可以重判。
+    """
+
+    outcome: AttentionOutcome
+    selected: Optional[DanmakuItem] = None
+
+    @property
+    def is_deferral(self) -> bool:
+        return self.outcome.is_deferral
+
+
+def parse_attention_choice(content: str, candidate_count: int) -> Optional[int]:
+    """把模型的回复解析成编号；不可解析就返回 ``None``。
+
+    严格到只接受「去掉首尾空白后正好一个完整整数 token」：``0`` 表示明确不读，
+    ``1..candidate_count`` 表示选中对应候选。越界、多个数字、带标点、混了
+    自然语言——**一律返回 ``None``，绝不猜测成一次选择**。
+
+    之所以不能宽松：旧实现用 ``str(i) in content[:10]`` 做子串匹配，
+    「``0，1号也不太合适``」会被读成「选 1 号」，也就是把一次**拒绝**
+    解析成了一次选择。宁可这一轮让行（可观测、可重判），也不能编一个选择出来。
+    """
+    if not isinstance(content, str):
+        return None
+    tokens = content.split()
+    if len(tokens) != 1:
+        return None
+    token = tokens[0]
+    # isdecimal() 排除正负号、小数点、罗马数字与 "²" 这类字符；全角数字
+    # （"１"）是无歧义的十进制数字，予以接受。
+    if not token.isdecimal():
+        return None
+    try:
+        index = int(token)
+    except ValueError:  # pragma: no cover - isdecimal 已保证可转换
+        return None
+    if index < 0 or index > max(0, candidate_count):
+        return None
+    return index
 
 
 class DanmakuSelector:
@@ -118,14 +167,14 @@ class DanmakuSelector:
                 return None
 
             start_time = datetime.now()
-            scored_danmaku = []
 
             try:
                 # 第一步：计算每条弹幕的基础评分
                 scored_danmaku = await self._calculate_base_scores(available_danmaku)
 
                 # 第二步：使用AI进行智能选择
-                selected = await self._ai_select_danmaku(scored_danmaku)
+                decision = await self._ai_select_danmaku(scored_danmaku)
+                selected = decision.selected
 
                 processing_time = (datetime.now() - start_time).total_seconds() * 1000
 
@@ -145,19 +194,14 @@ class DanmakuSelector:
 
             except Exception as e:
                 logger.error(f"弹幕选择过程出错: {e}")
-                processing_time = (datetime.now() - start_time).total_seconds() * 1000
-
-                # 出错回退也必须在池锁内成功 claim，不能返回一个陈旧候选。
-                if scored_danmaku:
-                    best = max(scored_danmaku, key=lambda x: x.priority)
-                    if await self._pool.claim_for_reply(best.id):
-                        return SelectionResult(
-                            selected_danmaku=best,
-                            selection_reason="出错回退：选择最高优先级",
-                            confidence_score=best.priority,
-                            processing_time_ms=processing_time
-                        )
-
+                # 本地异常也是让行，不是主播的决定：不 claim、不标记已回复、
+                # 不删除候选。旧实现在这里 claim 了「最高优先级」那条，等于任何
+                # 一个本地错误都能把注意力闸门整体绕过——闸门存在的意义就是
+                # 「看见 ≠ 读过」，故障绝不能替主播做「一定回复」的决定。
+                attention_gate_metrics.record(
+                    AttentionOutcome.DEFERRED_LOCAL_ERROR,
+                    candidate_count=len(available_danmaku),
+                )
                 return None
     
     async def _calculate_base_scores(self, danmaku_list: List[DanmakuItem]) -> List[DanmakuItem]:
@@ -166,9 +210,9 @@ class DanmakuSelector:
         基于配置的权重参数
         """
         current_persona = persona_engine.state
-        # P30：并发闸门满时 _ai_select_danmaku 会直接返回本地最高分候选，
-        # 绕过整个提示词。所以「正在等谁回话」必须同时落到本地打分里，
-        # 否则那条兜底路径上等待完全失效。
+        # P30：「正在等谁回话」既要进提示词，也要落到本地打分里——本地分决定
+        # 哪些候选进得了 AI 的视野（`ai_candidate_limit` 截断），排在窗口外面的
+        # 人就等于没被考虑过。注意力闸门本身不再有绕过 AI 的兜底路径。
         awaiting = self._awaiting_notes()
         bonus = float(settings.prompt_ram.selector_bonus)
 
@@ -286,16 +330,25 @@ class DanmakuSelector:
         match_count = sum(1 for kw in persona_keywords if kw in message_lower)
         return min(match_count / 2, 1.0)
     
-    async def _ai_select_danmaku(self, scored_danmaku: List[DanmakuItem]) -> Optional[DanmakuItem]:
-        """
-        使用AI进行智能选择
-        传入评分最高的前5条弹幕供AI选择
+    async def _ai_select_danmaku(self, scored_danmaku: List[DanmakuItem]) -> AttentionDecision:
+        """注意力闸门：由模型决定这一轮读谁、还是谁都不读。
+
+        返回 ``AttentionDecision`` 而不是 ``Optional[DanmakuItem]``，因为
+        「没有选中」有五种完全不同的原因，调用方与指标必须分得清：一种是主播
+        自己不想读（``IGNORED``），四种是系统让行（``DEFERRED_*``）。
+
+        这里**没有任何兜底选择**。并发满、模型失败、输出不可解析时都让行，
+        绝不退化成「选本地最高分那条」——那等于让故障替主播做出「一定回复」的
+        决定，`candidate_count == 1` 时更直接变成「单候选自动已读」。
+        让行不 claim、不标记已回复、不删除候选，后续 tick 会重新判定。
         """
         if not scored_danmaku:
-            return None
+            # 调用方已保证非空；这里没有做过任何判定，所以不记任何计数。
+            return AttentionDecision(AttentionOutcome.DEFERRED_LOCAL_ERROR)
         
         # 负载越高，发送给 AI 的候选越少，降低排队时的推理成本。
         top_candidates = scored_danmaku[:self._load_profile.ai_candidate_limit]
+        candidate_count = len(top_candidates)
         
         # 构建选择提示
         current_persona = persona_engine.state
@@ -332,21 +385,35 @@ class DanmakuSelector:
 3. 是否有助于互动氛围
 4. 是否避免重复或无聊的内容
 
-请直接回复以上候选的编号，如果不适合回复任何弹幕，请回复"0"。"""
-        
+"""
+        # 输出契约写得死一点：解析端只接受一个完整的整数 token，任何多余的
+        # 文字、标点或引号都会让这一轮变成「输出不可解析 → 让行」。这不是压缩
+        # 提示词（那被本轮明令禁止），而是让「不读」这个决定能被可靠地读出来。
+        prompt += (
+            "输出格式（严格遵守）：只输出一个数字，不要任何其他文字、标点、引号或解释。\n"
+            f"想回复第 N 条就只输出 N（1 到 {candidate_count}）；"
+            "这一轮谁都不想回复就只输出 0。"
+        )
+
         try:
             lease = concurrency_gate.try_acquire(
                 "ai:danmaku_selector",
                 settings.rate_limit.ai_selector_concurrency,
             )
-            if lease is None:
-                logger.warning("弹幕选择 AI 容量已满，使用本地最高分候选")
-                return top_candidates[0]
+        except Exception as e:
+            logger.error(f"注意力闸门取并发票失败，本轮让行: {e}")
+            return self._defer(AttentionOutcome.DEFERRED_LOCAL_ERROR, candidate_count)
+        if lease is None:
+            # 容量满 = 这一轮根本没问过模型，所以主播没有做任何决定。
+            logger.warning("弹幕选择 AI 容量已满，本轮让行（不读取任何候选）")
+            return self._defer(AttentionOutcome.DEFERRED_CAPACITY, candidate_count)
+
+        try:
             messages = [
                 {"role": "system", "content": f"你是{settings.persona.streamer_name}，一个互联网天使主播。"},
                 {"role": "user", "content": prompt}
             ]
-            
+
             try:
                 response = await ai_service.run(
                     messages=messages,
@@ -358,29 +425,44 @@ class DanmakuSelector:
                 )
             finally:
                 lease.release()
-            
-            if response and response.get("reply"):
-                content = response["reply"].strip()
-                
-                # 解析AI的选择
-                for i in range(1, len(top_candidates) + 1):
-                    if str(i) in content[:10]:  # 检查回复开头是否包含编号
-                        selected = top_candidates[i-1]
-                        logger.info(f"AI选择弹幕 [{i}]: {selected.message[:30]}...")
-                        return selected
-                
-                logger.debug("AI选择不回复任何弹幕")
-                return None
-            
         except Exception as e:
-            logger.error(f"AI选择弹幕失败: {e}")
-        
-        # AI选择失败时，返回评分最高的一条
-        if scored_danmaku:
-            logger.debug("AI选择失败，使用评分最高的弹幕")
-            return scored_danmaku[0]
-        
-        return None
+            # AIService 内部已经做过供应商回退；走到这里说明全都失败了。
+            # 本 tick 就此结束，不做任何无界同步重试。
+            logger.error(f"注意力闸门调用失败，本轮让行: {e}")
+            return self._defer(AttentionOutcome.DEFERRED_MODEL_FAILURE, candidate_count)
+
+        if not response or not response.get("reply"):
+            logger.warning("注意力闸门无有效返回，本轮让行")
+            return self._defer(AttentionOutcome.DEFERRED_MODEL_FAILURE, candidate_count)
+
+        content = str(response["reply"]).strip()
+        index = parse_attention_choice(content, candidate_count)
+        if index is None:
+            # 歧义/越界/混杂输出：不猜。这一路单独计数，才能把「解析失败率」
+            # 和「主播主动忽略率」分开看——否则换模型时两者会互相掩盖。
+            logger.warning("注意力闸门输出不可解析（长度 %d），本轮让行", len(content))
+            logger.debug("不可解析的注意力输出（截断）: %s", content[:20])
+            return self._defer(AttentionOutcome.DEFERRED_INVALID_OUTPUT, candidate_count)
+
+        if index == 0:
+            logger.info("注意力闸门：这一轮不读任何弹幕（%d 条候选）", candidate_count)
+            attention_gate_metrics.record(
+                AttentionOutcome.IGNORED, candidate_count=candidate_count
+            )
+            return AttentionDecision(AttentionOutcome.IGNORED)
+
+        selected = top_candidates[index - 1]
+        logger.info(f"AI选择弹幕 [{index}]: {selected.message[:30]}...")
+        attention_gate_metrics.record(
+            AttentionOutcome.SELECTED, candidate_count=candidate_count
+        )
+        return AttentionDecision(AttentionOutcome.SELECTED, selected)
+
+    @staticmethod
+    def _defer(outcome: AttentionOutcome, candidate_count: int) -> AttentionDecision:
+        """让行：记一次计数，什么都不选。绝不 claim、不标记已回复、不删除候选。"""
+        attention_gate_metrics.record(outcome, candidate_count=candidate_count)
+        return AttentionDecision(outcome)
     
     def get_selector_stats(self) -> dict:
         """获取选择器统计信息"""

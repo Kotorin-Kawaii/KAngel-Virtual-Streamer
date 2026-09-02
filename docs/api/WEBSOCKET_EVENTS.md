@@ -1,6 +1,6 @@
 # WebSocket 前端事件清单
 
-对应后端枚举 [`src/kangel/transport/websocket/protocol.py`](../../src/kangel/transport/websocket/protocol.py)，更新于 2026-08-31。连接地址为 `/danmaku`；所有事件使用 UTF-8 JSON 文本帧。除 `history_batch`、`confirmation` 和 `error` 外，事件均使用顶层 `{ "type", "data" }` 包装。
+对应后端枚举 [`src/kangel/transport/websocket/protocol.py`](../../src/kangel/transport/websocket/protocol.py)，更新于 2026-08-10。连接地址为 `/danmaku`；所有事件使用 UTF-8 JSON 文本帧。除 `history_batch`、`confirmation` 和 `error` 外，事件均使用顶层 `{ "type", "data" }` 包装。
 
 这是当前版本前端可消费事件的完整清单。详细字段类型与 HTTP 契约见 [FRONTEND.md](FRONTEND.md)。未知 `type` 必须安全忽略并记录开发日志，不能因此断开连接。
 
@@ -29,7 +29,7 @@
 
 1. 重连后等待 `mood_update` 与 `stream_metadata` 快照；按需用认证 `GET /sc` 恢复当前账号的 SC 状态。
 2. 不补造 `streamer_activity`、`streamer_idle_state`、`streamer_beat`、`viewer_emote` 或 `danmaku_selected`；它们是增量展示，不是可回放事实。
-3. 失效令牌不会触发专用认证关闭码，而是降级为游客连接；`1009` 表示帧过大，修正负载后再连接；`1013` 表示容量/频率限制，使用带抖动退避。
+3. `1008` 表示认证失败，停止自动重连并要求重新登录；`1009` 表示帧过大，修正负载后再连接；`1013` 表示容量/频率限制，使用带抖动退避。
 
 ## 客户端可发送的消息
 

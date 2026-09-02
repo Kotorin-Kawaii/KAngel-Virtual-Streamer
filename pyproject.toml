@@ -1,7 +1,7 @@
 [project]
 name = "kangel-server"
-version = "0.3.0"
-description = "AI virtual streamer backend with persistent persona, viewer continuity, WebSocket interaction and OpenAI-compatible model support"
+version = "0.1.0"
+description = "虚拟主播直播系统 - 支持RAG增强的弹幕回复生成"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [

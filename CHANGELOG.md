@@ -2,6 +2,42 @@
 
 此项目仍在快速迭代中。正式版本发布后会按语义化版本维护更详细的更新记录。
 
+## 0.4.0
+
+v0.4.0 聚焦注册观众连续性与自愿赞助资金透明。两个功能都保持默认关闭，维护者需要显式
+配置后才会启用。
+
+### Viewer Impression
+
+- 注册并开启长期记忆的用户可通过认证接口低频请求一份持久私人留言；生成任务异步执行，
+  不阻塞弹幕、SC 或普通回复链。
+- 使用独立 `viewer_impression` AI role，必须显式配置模型，不回退普通回复模型；支持独立
+  timeout、reasoning、并发、lease、重试和执行令牌。
+- 生成时冻结证据快照并按预算选取长期关系、对话片段、话题摘要和情景记忆；成功后才开始
+  默认 7 天冷却，失败不会覆盖已有留言。
+- 留言参与账号长期记忆的导出与删除治理，但不会写回长期记忆，也不会改变 Relationship、
+  Persona 或 Stream 状态。
+
+### Sponsor Fund Transparency
+
+- 增加爱发电 `query-order` 有界同步、Decimal 金额解析和不含用户身份的订单财务账本。
+- 增加月度收入聚合、手工支出登记、编辑与作废，以及独立 Finance Sync Worker。
+- `GET /sponsor/transparency` 只公开累计收入、支出、结余、月度汇总和资金用途；不会公开
+  单个赞助者金额、订单号、平台用户 ID、留言或支付信息。
+- 收入只能来自成功订单同步，管理端不能直接修改收入总额；赞助不授予权限、SC 额度或
+  任何排队优先级。
+
+### Fixes / Reliability
+
+- 加固 Viewer Impression 的 Provider 时间窗、证据预算、lease 续期、重试与段落换行处理。
+- 加固弹幕 attention read gate，并增加低开销时序诊断；现有回复、感谢墙和直播主链保持兼容。
+
+### Compatibility
+
+- SQLite 在启动时幂等创建新增表，不需要手工数据库迁移。
+- Viewer Impression、Sponsor Transparency 和 Finance Sync 均默认关闭；升级步骤见
+  [`docs/MIGRATION_V040.md`](docs/MIGRATION_V040.md)。
+
 ## 0.3.0
 
 这是自分层架构快照以来的一次集中追赶版本，重点是让主播在连续直播中保持可解释、可

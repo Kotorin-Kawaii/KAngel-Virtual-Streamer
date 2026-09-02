@@ -74,7 +74,7 @@ class HttpProtectionMiddleware:
         # 与其他 cheap_read 同级：不占用过载配额，也不该因繁忙而 503。
         cheap_read = path in {
             "/", "/status", "/stream/metadata", "/emotion/list",
-            "/sponsor/config", "/sponsors",
+            "/sponsor/config", "/sponsors", "/sponsor/transparency",
         }
         if not cheap_read:
             # 延迟导入避免应用启动时的模块环；控制面保持可用。

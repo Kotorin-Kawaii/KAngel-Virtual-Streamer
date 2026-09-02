@@ -11,6 +11,11 @@ _MODULES = {
     "afdian_client": "client",
     "sponsor_service": "service",
     "sponsor_sync_worker": "sync_worker",
+    "SponsorFinanceService": "finance",
+    "SponsorFinanceError": "finance",
+    "SponsorFinanceSyncWorker": "finance_sync_worker",
+    "sponsor_finance_service": "finance",
+    "sponsor_finance_sync_worker": "finance_sync_worker",
 }
 __all__ = list(_MODULES)
 

@@ -1,6 +1,6 @@
 """爱发电（afdian）开放 API 客户端。
 
-只用到 query-sponsor 一个接口：拉取赞助者列表用于站内感谢墙。
+使用 query-sponsor 拉取感谢墙名单，并使用 query-order 拉取财务透明所需的付款流水。
 凭据（user_id / token）只在服务端使用，禁止出现在响应或日志中。
 
 签名规则（爱发电开放 API）：
@@ -21,6 +21,7 @@ from config import settings
 
 API_BASE = "https://afdian.com/api/open"
 QUERY_SPONSOR_PATH = "/query-sponsor"
+QUERY_ORDER_PATH = "/query-order"
 
 
 class AfdianError(Exception):
@@ -72,6 +73,25 @@ class AfdianClient:
             raise AfdianError("invalid_response", "爱发电返回体不是对象")
         if payload.get("ec") != 200:
             # em 由爱发电返回，可能含中文说明；不含我方凭据。
+            raise AfdianError(
+                "api_error", f"ec={payload.get('ec')} em={payload.get('em')}"
+            )
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise AfdianError("invalid_response", "爱发电返回缺少 data")
+        return data
+
+    def query_order_page(self, page: int) -> dict[str, Any]:
+        """拉取一页订单；调用方只提取金额、付款时间和状态。"""
+        body = self.build_request_body(page)
+        payload = self._post_json_sync(
+            f"{API_BASE}{QUERY_ORDER_PATH}",
+            body,
+            settings.sponsor.sync_timeout_seconds,
+        )
+        if not isinstance(payload, dict):
+            raise AfdianError("invalid_response", "爱发电返回体不是对象")
+        if payload.get("ec") != 200:
             raise AfdianError(
                 "api_error", f"ec={payload.get('ec')} em={payload.get('em')}"
             )

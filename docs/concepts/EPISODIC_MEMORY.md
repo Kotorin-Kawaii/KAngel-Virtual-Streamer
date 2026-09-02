@@ -1,4 +1,4 @@
-# 主播情景记忆
+# P24 主播情景记忆
 
 P24 与 P21 的公开场次总结分离。P21 只说明“本场播了什么、房间整体怎样”；P24 保存主播值得在意的具体事件，例如高重要性倾诉、支持互动、共同玩梗、SC、活动里程碑和边界事件。P24 的候选冻结不依赖 P21 开关；P21 关闭或重启恢复时，仍会按候选场次 ID 独立收口。
 
@@ -16,7 +16,7 @@ EPISODIC_MEMORY__AI_ENABLED=False
 AI__SESSION_MEMORY_MODEL=deepseek-v4-flash
 ```
 
-## 可靠性与治理
+## Reliability v1
 
 P24 任务现在按 bounded batch 执行，默认每次模型调用最多 8 个候选；一场直播最多 48 个候选，批次之间保留独立的 reflection fragment，最终合并为整场反思。`stream_memory_tasks` 的状态包括 `pending`、`processing`、`failed_retryable`、`completed` 和终态 `failed`；`stream_memory_candidates` 使用 `pending`、`claimed`、`summarized`、`discarded`。`pending` 只表示仍有真实消费路径，明确未选中的候选会写入 `discarded` 及 `resolution_code`。
 
@@ -24,7 +24,7 @@ P24 任务现在按 bounded batch 执行，默认每次模型调用最多 8 个�
 
 只有配置的批次数上限、明确的数据治理/删除竞态等确定性情况才进入 task 终态 `failed`；进入终态前所有 task 输入候选都会写入 `discarded` 和原因，绝不会留下不可解释的 pending。
 
-常用配置：
+新增配置：
 
 ```dotenv
 EPISODIC_MEMORY__AI_ENABLED=True
@@ -34,10 +34,26 @@ EPISODIC_MEMORY__RETRY_BACKOFF_SECONDS=30
 EPISODIC_MEMORY__RETRY_BACKOFF_MAX_SECONDS=1800
 ```
 
-发布包只包含运行时链路，不包含维护者使用的历史回填、生产回放和数据库审计脚本。
-普通用户升级时，新增表和索引由应用启动幂等创建，**No manual migration required**。
-如果需要对历史数据库回填情景记忆，请先复制数据库并在私有维护环境完成只读审计，
-不要把真实弹幕、账号或导出文件提交到公共仓库。
+迁移和副本回放：
 
-管理员可通过受保护的 `/memory/episodic/stats` 查看不含身份和原文的低基数任务状态；
-管理接口默认关闭。
+```bash
+.venv/bin/python scripts/migrate_stream_memory_reliability.py --db /path/to/copy.db --direction upgrade --apply
+.venv/bin/python scripts/migrate_stream_memory_reliability.py --db /path/to/copy.db --direction downgrade --apply
+.venv/bin/python scripts/migrate_stream_memory_reliability.py --db /path/to/copy.db --direction upgrade --apply
+.venv/bin/python scripts/verify_stream_memory_recovery_v1.py --db /path/to/stream_data.db
+```
+
+最后一个命令会复制输入数据库，在副本上用确定性 fake provider 回放 08/13 至 08/16 的历史任务，同时确认 08/17 active 场次仍保持 pending，并比较输入数据库 SHA-256。
+
+开启前应先通过只读回填审计：
+
+```bash
+.venv/bin/python scripts/backfill_episodic_memory.py --db /path/to/stream_data.db
+# 等价显式只读模式
+.venv/bin/python scripts/backfill_episodic_memory.py --db /path/to/stream_data.db --dry-run
+```
+
+确认候选范围后，才显式执行 `--apply`。默认仅把 `2026-07-30` 及之后、且通过真实
+`account_conversation_fragments.danmaku_id` 关联的片段归属到账号；更早数据即使有昵称或旧片段也降级为匿名房间事件。回填按 `Asia/Shanghai` 与每日 06:00 至次日 03:00 直播日边界归档。候选和任务使用唯一键与场次状态，重复 `--apply` 会复用已有记录，进程中断后再次执行即可续跑。
+
+管理员可通过 `/memory/episodic/stats` 查看不含身份和原文的低基数任务状态。

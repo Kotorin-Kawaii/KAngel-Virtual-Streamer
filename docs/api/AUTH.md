@@ -12,7 +12,7 @@
 - refresh Cookie 的 Path 固定为 `/auth/refresh`，每次成功刷新都会轮换，已使用的 refresh token 不能再次使用。
 - 生产 HTTPS 环境应设置 `AUTH__COOKIE_SECURE=true`。
 - 未携带令牌的 WebSocket 保持现有游客行为。
-- 携带无效或过期令牌的 WebSocket 会安全降级为游客连接；HTTP 认证接口仍返回 `401`。
+- 携带无效或过期令牌时不会降级为游客，而是以 WebSocket 关闭码 `1008` 拒绝连接。
 
 ## 1. 创建账号
 
@@ -308,7 +308,7 @@ const ws = new WebSocket("ws://localhost:8000/danmaku");
 1. 同源浏览器只使用服务端设置的 `HttpOnly` access/refresh Cookie，不要由 JavaScript 复制、缓存或持久化任何令牌。
 2. 生产环境必须使用 HTTPS/WSS，并设置 `AUTH__COOKIE_SECURE=true`。
 3. 查询参数仅用于 Cookie 不可用的客户端；不要把含令牌 URL 写入日志、埋点、错误上报或分享内容。
-4. `GET /auth/profile` 首次 `401` 时，先调用一次 `/auth/refresh` 并重试 profile；仅当 refresh 或重试仍是 `401` 时才清除本地登录状态。WebSocket 携带失效令牌时会降级为游客，不应把它误判为已登录连接。
+4. `GET /auth/profile` 首次 `401` 时，先调用一次 `/auth/refresh` 并重试 profile；仅当 refresh 或重试仍是 `401` 时才清除本地登录状态。WebSocket `1008` 也应遵循同一恢复流程。
 5. `account_id` 仅用于前端关联账号数据，不能替代访问令牌进行认证。
 6. 登录账号只能通过 `PATCH /auth/profile/nickname` 改名，不要通过弹幕字段尝试修改昵称。
 

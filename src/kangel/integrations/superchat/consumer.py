@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from config import settings
 from kangel.infrastructure.bounded_work_gate import ai_reply_work_gate
 from kangel.infrastructure.reply_timing import reply_timing_metrics
+from kangel.infrastructure.timing_trace import current_trace_id, timing_trace_recorder
 from kangel.transport.websocket.connection_manager import connection_manager
 from kangel.transport.websocket.protocol import WebSocketEventType
 from kangel.persona.application.engine import persona_engine
@@ -56,6 +57,7 @@ class SCConsumer:
                 await asyncio.sleep(settings.sc.poll_interval_seconds)
 
     async def process_once(self) -> bool:
+        current_trace_id.set(None)
         item = await asyncio.to_thread(
             self.service.claim_next, settings.sc.processing_lease_seconds
         )
@@ -84,6 +86,11 @@ class SCConsumer:
             )
             from kangel.stream.application.metadata import stream_metadata_pusher
             stream_session_id = stream_metadata_pusher.get_current_stream_session_id()
+            # SC 是「必读」路径，没有注意力闸门，所以不打 attention 检查点——
+            # read_to_reply 对 SC 不产出，arrival_to_reply 才是它的端到端口径。
+            trace_id = f"sc:{item['sc_id']}"
+            timing_trace_recorder.start(trace_id, path="sc")
+            current_trace_id.set(trace_id)
             result = await persona_engine.generate_reply({
                 "nickname": item["nickname"],
                 "message": item["content"],
@@ -107,7 +114,9 @@ class SCConsumer:
             )
             if not completed:
                 logger.warning("SC 完成时租约状态已变化: %s", item["sc_id"])
+                timing_trace_recorder.finish(trace_id, outcome="degraded")
                 return True
+            timing_trace_recorder.mark(trace_id, "reply_record_finished_at")
             try:
                 episodic_memory_manager.capture_reply(
                     stream_session_id=stream_session_id,
@@ -135,6 +144,8 @@ class SCConsumer:
                     "broadcast", (perf_counter() - broadcast_started_at) * 1000,
                     path="sc",
                 )
+            timing_trace_recorder.mark(trace_id, "broadcast_at")
+            timing_trace_recorder.finish(trace_id, outcome="success")
             await self._broadcast_status(item, "replied", reply=reply_data)
             # SC 完成只是一个低频、可合并的 Director 信号；不保证触发 AI，
             # 更不保证产生事实变化或公开演出。
@@ -178,9 +189,12 @@ class SCConsumer:
             logger.info("SC 回复生成并广播成功 [%s]", item["sc_id"])
             return True
         except asyncio.CancelledError:
+            # 用 ContextVar 取回 trace，因为异常可能发生在 trace_id 赋值之前。
+            timing_trace_recorder.finish(current_trace_id.get(), outcome="error")
             await asyncio.to_thread(self.service.release_claim, item["sc_id"])
             raise
         except Exception as exc:
+            timing_trace_recorder.finish(current_trace_id.get(), outcome="error")
             logger.error("SC 处理失败 [%s]: %s", item["sc_id"], exc)
             failure_code = str(exc)
             if failure_code not in {

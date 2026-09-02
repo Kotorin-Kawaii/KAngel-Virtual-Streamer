@@ -496,12 +496,37 @@ var PANELS = [
   { group: "直播", title: "心情推送统计", path: "/mood/pusher/stats" },
 
   { group: "安全与限流", title: "运行指标", path: "/admin/security/stats" },
+  { group: "安全与限流", title: "端到端时序追踪", path: "/admin/timing-trace",
+    note: "每条弹幕的检查点序列；attempt 与逻辑耗时之差就是回退/等待成本" },
   { group: "安全与限流", title: "表情统计", path: "/admin/emotes/stats" },
   { group: "安全与限流", title: "表情配置", path: "/emotes/config" },
   { group: "安全与限流", title: "审核统计", path: "/admin/moderation/stats" },
 
   { group: "赞助", title: "赞助同步健康度", path: "/admin/sponsor/stats" },
   { group: "赞助", title: "赞助名单（公开口径）", path: "/sponsors" },
+  { group: "赞助", title: "资金透明概览", path: "/sponsor/transparency" },
+  { group: "赞助", title: "资金收入同步状态", path: "/admin/sponsor/finance/stats" },
+  { group: "赞助", title: "手动同步收入", path: "/admin/sponsor/finance/sync", method: "POST" },
+  { group: "赞助", title: "支出记录", path: "/admin/sponsor/expenses", params: [{ name: "include_void", value: "true" }] },
+  { group: "赞助", title: "新增支出", path: "/admin/sponsor/expenses", method: "POST", danger: true,
+    params: [
+      { name: "month", value: "2026-09", inBody: true },
+      { name: "amount_cents", value: "0", inBody: true, type: "number" },
+      { name: "category", value: "ai_api", inBody: true },
+      { name: "title", value: "", inBody: true },
+      { name: "public_note", value: "", inBody: true },
+    ], confirm: "将新增一条 active 支出记录；金额使用整数分，错误后请作废。" },
+  { group: "赞助", title: "编辑支出", path: "/admin/sponsor/expenses/{entry_id}", method: "PUT", danger: true,
+    params: [
+      { name: "entry_id", value: "", inPath: true },
+      { name: "month", value: "2026-09", inBody: true },
+      { name: "amount_cents", value: "0", inBody: true, type: "number" },
+      { name: "category", value: "ai_api", inBody: true },
+      { name: "title", value: "", inBody: true },
+      { name: "public_note", value: "", inBody: true },
+    ], confirm: "将更新指定 active 支出记录。已作废记录不可编辑。" },
+  { group: "赞助", title: "作废支出", path: "/admin/sponsor/expenses/{entry_id}/void", method: "POST", danger: true,
+    params: [{ name: "entry_id", value: "", inPath: true }], confirm: "将把指定支出标记为 void，公开统计不再计入，且不可删除。" },
 
   { group: "数据库", title: "数据库统计", path: "/database/stats" },
   { group: "数据库", title: "弹幕记录", path: "/database/danmaku",
@@ -580,7 +605,14 @@ function buildBody(p, body) {
       if (inputs[k].spec.inPath) {
         if (v === "") missing.push(k);
         path = path.replace("{" + k + "}", encodeURIComponent(v));
-      } else if (inputs[k].spec.inBody) { body = body || {}; body[k] = v; }
+      } else if (inputs[k].spec.inBody) {
+        body = body || {};
+        if (inputs[k].spec.type === "number") {
+          var n = Number(v);
+          if (!isFinite(n)) { missing.push(k); return; }
+          body[k] = n;
+        } else { body[k] = v; }
+      }
       else if (v !== "") qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(v));
     });
     if (missing.length) {

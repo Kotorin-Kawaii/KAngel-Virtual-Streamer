@@ -13,15 +13,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import settings
 from config.settings import AIProvider
 
+from kangel.infrastructure.timing_trace import record_attempt_current
+
 from .token_audit import token_audit_recorder
 
 logger = logging.getLogger(__name__)
 
 # 角色标识：调用方通过 role 选择供应商链，而非硬编码模型名。
-Role = str  # 包括回复、分析、记忆及可选 stream_director 角色
+Role = str  # 包括回复、分析、记忆及可选 stream_director/viewer_impression 角色
 
 _VALID_ROLES = frozenset({
-    "default", "qa_selector", "danmaku_selector", "impact_analysis", "intent_shadow", "moderation", "session_memory", "stream_director",
+    "default", "qa_selector", "danmaku_selector", "impact_analysis", "intent_shadow",
+    "moderation", "session_memory", "stream_director", "viewer_impression",
 })
 
 # Do not rely on urllib's default ``Python-urllib/*`` User-Agent.  Some
@@ -84,9 +87,11 @@ class AIService:
 
     @staticmethod
     def _get_model_for_role(provider: AIProvider, role: str) -> str:
-        """根据角色从供应商配置中获取模型名；未配的角色回退到 default。"""
+        """根据角色获取模型；Viewer Impression 不允许静默回退普通主播模型。"""
         models = provider.models
         role_model = getattr(models, role, None)
+        if role == "viewer_impression":
+            return role_model or ""
         return role_model or models.default
 
     def _select_providers(self, role: str) -> List[Tuple[AIProvider, str]]:
@@ -103,8 +108,14 @@ class AIService:
                 "moderation": settings.ai.moderation_model or settings.ai.default_model,
                 "session_memory": settings.ai.session_memory_model or settings.ai.default_model,
                 "stream_director": settings.ai.stream_director_model or settings.ai.default_model,
+                "viewer_impression": settings.ai.viewer_impression_model,
             }
             model = model_map.get(role, settings.ai.default_model)
+            if not model:
+                # A role without an explicit model is intentionally unavailable
+                # for privacy-sensitive side channels such as viewer_impression.
+                # Do not expose a diagnostic route whose model is ``None``.
+                return []
             pseudo = AIProvider(
                 name="legacy",
                 base_url=settings.ai.base_url,
@@ -129,7 +140,7 @@ class AIService:
     # ------------------------------------------------------------------
 
     def has_role(self, role: str) -> bool:
-        """检查是否有供应商能服务该角色（含 default 回退）。"""
+        """检查是否有供应商能服务该角色；Viewer Impression 不含 default 回退。"""
         if role not in _VALID_ROLES:
             return False
         if not settings.ai.providers:
@@ -142,12 +153,19 @@ class AIService:
                 "moderation": settings.ai.moderation_model,
                 "session_memory": settings.ai.session_memory_model or settings.ai.default_model,
                 "stream_director": settings.ai.stream_director_model or settings.ai.default_model,
+                "viewer_impression": settings.ai.viewer_impression_model,
             }
             return bool(model_map.get(role))
         for p in settings.ai.providers:
             if p.enabled and self._get_model_for_role(p, role):
                 return True
         return False
+
+    def has_active_role(self, role: str) -> bool:
+        """检查当前时刻是否有处于时间窗内的角色供应商。"""
+        if role not in _VALID_ROLES:
+            return False
+        return bool(self._select_providers(role))
 
     def runtime_diagnostics(self) -> Dict[str, Any]:
         """返回无密钥的最终角色路由、timeout 与 reasoning 诊断。"""
@@ -160,6 +178,7 @@ class AIService:
             "moderation": settings.ai.moderation_timeout,
             "session_memory": settings.ai.session_memory_timeout,
             "stream_director": settings.ai.stream_director_timeout,
+            "viewer_impression": settings.ai.viewer_impression_timeout,
         }
         roles: Dict[str, Any] = {}
         for role in sorted(_VALID_ROLES):
@@ -300,14 +319,18 @@ class AIService:
         error_kind: Optional[str] = None,
     ) -> None:
         """记一次调用的 token 用量；审计失败绝不影响回复链路。"""
+        latency_ms = int((time.perf_counter() - started) * 1000)
         try:
             token_audit_recorder.record(
                 role=role, provider=provider, model=model, status=status,
                 usage=usage, error_kind=error_kind,
-                latency_ms=int((time.perf_counter() - started) * 1000),
+                latency_ms=latency_ms,
             )
         except Exception:  # pragma: no cover - 记账不允许向上冒泡
             logger.debug("P29 token 审计记录失败，已忽略")
+        # 延迟优化 v1 §2：这里是唯一同时覆盖成功与失败的收口，所以 attempt 级
+        # 时序也挂在这里——一次逻辑调用回退几家，就会自然产生几条 attempt。
+        record_attempt_current(role=role, status=status, latency_ms=latency_ms)
 
     async def run(
         self,
@@ -410,13 +433,12 @@ class AIService:
                     status="failed", started=started, error_kind=self._error_kind(exc),
                 )
                 logger.warning(
-                    "供应商 '%s' (模型 '%s', 角色 '%s') 请求失败，尝试回退: %s",
+                    "供应商 '%s' (模型 '%s', 角色 '%s') 请求失败，尝试回退: "
+                    "timeout=%ss elapsed=%dms kind=%s",
                     provider.name, model_name, role,
-                    "timeout=%ss elapsed=%dms kind=%s: %s" % (
-                        effective_timeout,
-                        int((time.perf_counter() - started) * 1000),
-                        self._error_kind(exc), exc,
-                    ),
+                    effective_timeout,
+                    int((time.perf_counter() - started) * 1000),
+                    self._error_kind(exc),
                 )
                 continue
 
