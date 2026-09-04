@@ -9,7 +9,7 @@ WebSocket 接收弹幕并广播事件，同时在 SQLite 中持续保存主播�
 运行时不要求 Redis 或其他必需的外部服务；正式部署建议保持单 Python 进程写入一个 SQLite
 数据目录。
 
-在线体验：<https://kotorin-kawaii.github.io/KangelAI/>（该页面连接维护者部署的服务，
+在线体验：<[https://kangelai.kotorin.cn/](http://kangelai.kotorin.cn/)>（该页面连接维护者部署的服务，
 自行部署时请替换前端 API/WebSocket 地址）。
 
 本仓库只发布服务端 Runtime、HTTP/WebSocket API、任务与配置能力，不包含维护者的私有
