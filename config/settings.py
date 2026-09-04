@@ -26,6 +26,9 @@ class ProviderModelMapping(BaseModel):
     session_memory: Optional[str] = None
     stream_director: Optional[str] = None
     viewer_impression: Optional[str] = None
+    viewer_memory_archaeologist: Optional[str] = None
+    viewer_impression_synthesizer: Optional[str] = None
+    viewer_impression_critic: Optional[str] = None
 
 
 class ProviderReasoningMapping(BaseModel):
@@ -39,6 +42,9 @@ class ProviderReasoningMapping(BaseModel):
     session_memory: Optional[Literal["off", "low", "medium", "high"]] = None
     stream_director: Optional[Literal["off", "low", "medium", "high"]] = None
     viewer_impression: Optional[Literal["off", "low", "medium", "high"]] = None
+    viewer_memory_archaeologist: Optional[Literal["off", "low", "medium", "high"]] = None
+    viewer_impression_synthesizer: Optional[Literal["off", "low", "medium", "high"]] = None
+    viewer_impression_critic: Optional[Literal["off", "low", "medium", "high"]] = None
 
 
 class AIProvider(BaseModel):
@@ -126,6 +132,12 @@ class AIConfig(BaseSettings):
         default=None, description="Viewer Impression 专用模型；留空表示该功能不可用"
     )
     viewer_impression_timeout: int = Field(default=300, ge=5, le=900)
+    viewer_memory_archaeologist_model: Optional[str] = None
+    viewer_impression_synthesizer_model: Optional[str] = None
+    viewer_impression_critic_model: Optional[str] = None
+    viewer_memory_archaeologist_timeout: int = Field(default=600, ge=5, le=1800)
+    viewer_impression_synthesizer_timeout: int = Field(default=300, ge=5, le=900)
+    viewer_impression_critic_timeout: int = Field(default=300, ge=5, le=900)
 
     # —— 多供应商配置 ——
     providers: list[AIProvider] = Field(
@@ -558,6 +570,21 @@ class ViewerImpressionConfig(BaseSettings):
     max_topic_evidence: int = Field(default=8, ge=0, le=100)
     max_episodic_evidence: int = Field(default=5, ge=0, le=100)
     max_prompt_chars: int = Field(default=12000, ge=1000, le=50000)
+    # Deep Reflection v2: independent, bounded history and per-stage budgets.
+    # The legacy evidence/prompt limits above apply only to frozen v1 tasks.
+    max_fragment_candidates: int = Field(default=500, ge=1, le=2000)
+    max_topic_candidates: int = Field(default=100, ge=1, le=2000)
+    max_episodic_candidates: int = Field(default=100, ge=1, le=2000)
+    max_nickname_history: int = Field(default=50, ge=1, le=500)
+    archaeologist_max_prompt_chars: int = Field(default=600000, ge=8000, le=4000000)
+    synthesizer_max_prompt_chars: int = Field(default=80000, ge=8000, le=500000)
+    writer_max_prompt_chars: int = Field(default=40000, ge=8000, le=500000)
+    critic_max_prompt_chars: int = Field(default=80000, ge=8000, le=500000)
+    max_repair_passes: int = Field(default=1, ge=0, le=1)
+    max_archaeology_chunks: int = Field(default=256, ge=1, le=1024)
+    stage_output_chars: int = Field(default=8000, ge=1000, le=80000)
+    allow_v1_fallback: bool = False
+    allow_without_critic: bool = False
     max_output_chars: int = Field(default=1800, ge=100, le=10000)
     worker_concurrency: int = Field(default=1, ge=1, le=4)
     max_pending_tasks: int = Field(default=100, ge=1, le=10000)

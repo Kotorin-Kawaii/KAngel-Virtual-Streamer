@@ -42,7 +42,7 @@ class ViewerImpressionLetter(BaseModel):
 
 class ViewerImpressionGeneration(BaseModel):
     task_id: str
-    status: Literal["pending", "processing", "failed_retryable"]
+    status: Literal["pending", "processing", "failed_retryable", "failed"]
     requested_at: str
     next_attempt_at: Optional[str] = None
 

@@ -91,7 +91,10 @@ AI__QA_SELECTOR_MODEL=replace-with-your-fast-model
 AI__DANMAKU_SELECTOR_MODEL=replace-with-your-fast-model
 AI__IMPACT_ANALYSIS_MODEL=replace-with-your-balanced-model
 # 留空时 Viewer Impression 保持 unavailable，绝不回退普通回复模型
+AI__VIEWER_MEMORY_ARCHAEOLOGIST_MODEL=
+AI__VIEWER_IMPRESSION_SYNTHESIZER_MODEL=
 AI__VIEWER_IMPRESSION_MODEL=
+AI__VIEWER_IMPRESSION_CRITIC_MODEL=
 ```
 
 服务端统一请求 `{AI__BASE_URL}/chat/completions`。OpenAI、SiliconFlow、兼容网关或本地
@@ -123,7 +126,7 @@ AI__VIEWER_IMPRESSION_MODEL=
 | 排期、时区、每日主题、活动 | `.env` 的 `STREAM__*` |
 | 观众记忆保留与提示词预算 | `.env` 的 `MEMORY__*`、`EPISODIC_MEMORY__*` |
 | SC、表情、管理和限流 | `.env` 的 `SC__*`、`EMOTES__*`、`MODERATION__*`、`RATE_LIMIT__*` |
-| Viewer Impression | `.env` 的 `VIEWER_IMPRESSION__*` 与专用 `viewer_impression` AI role |
+| Viewer Impression | `.env` 的 `VIEWER_IMPRESSION__*` 与四个专用 AI role（`viewer_memory_archaeologist`、`viewer_impression_synthesizer`、`viewer_impression`、`viewer_impression_critic`） |
 | 自愿赞助、感谢墙与资金透明 | `.env` 的 `SPONSOR__*`；凭据只放服务端 |
 
 保留这条语义约束很重要：**当前观众的直接问题和已建立的对话语义，永远优先于每日
@@ -167,6 +170,7 @@ WebSocket Upgrade、WAF/防火墙和入口层限流；应用内限流不能替�
 - [系统架构说明](docs/architecture/OVERVIEW.md)
 - [登录观众长期记忆](docs/concepts/LONG_TERM_MEMORY.md)
 - [主播情景记忆](docs/concepts/EPISODIC_MEMORY.md)
+- [Viewer Impression Deep Reflection v2](docs/VIEWER_IMPRESSION_DEEP_REFLECTION_V2.md)
 - [部署指南](docs/DEPLOYMENT.md)
 - [插件开发指南](docs/plugins/DEVELOPMENT.md)
 - [v0.3.0 迁移指南](docs/MIGRATION_V030.md)

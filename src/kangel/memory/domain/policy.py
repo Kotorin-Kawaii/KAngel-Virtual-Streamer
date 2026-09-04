@@ -14,7 +14,10 @@ class AccountMemoryPolicy:
         re.IGNORECASE,
     )
     _redactions = (
-        (re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"), "[已隐藏邮箱]"),
+        # Start only at a local-part boundary. Without this guard a long word
+        # with no '@' retries the greedy prefix at every character (quadratic),
+        # which is costly for v2's retained long summaries even off the event loop.
+        (re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"), "[已隐藏邮箱]"),
         (re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"), "[已隐藏手机号]"),
         (re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)"), "[已隐藏证件号]"),
         (re.compile(

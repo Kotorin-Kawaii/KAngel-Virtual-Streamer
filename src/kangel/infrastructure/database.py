@@ -441,6 +441,70 @@ class DatabaseManager:
                 "VALUES ('account_viewer_impression_v2_audit')"
             )
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS account_viewer_impression_stages (
+                    task_id TEXT NOT NULL,
+                    stage_key TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, stage_key),
+                    FOREIGN KEY (task_id) REFERENCES account_viewer_impression_tasks(task_id)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS account_viewer_impression_epochs (
+                    account_id TEXT PRIMARY KEY,
+                    epoch INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            # A monotonic privacy epoch closes the gap between reading a large
+            # snapshot and accepting it: disable/clear/delete followed by
+            # immediate re-enable must not admit the old in-memory snapshot.
+            for trigger_name, table, event, condition, account_expr in (
+                ("impression_optout_cleanup", "account_memory_preferences", "UPDATE OF long_term_memory_enabled",
+                 "NEW.long_term_memory_enabled = 0", "NEW.account_id"),
+                ("impression_nickname_cleanup", "account_nickname_history", "DELETE", "1", "OLD.account_id"),
+                ("impression_account_cleanup", "accounts", "DELETE", "1", "OLD.account_id"),
+            ):
+                cursor.execute(f"""
+                    CREATE TRIGGER IF NOT EXISTS {trigger_name} AFTER {event} ON {table}
+                    WHEN {condition}
+                    BEGIN
+                        INSERT INTO account_viewer_impression_epochs(account_id, epoch)
+                        VALUES ({account_expr}, 1)
+                        ON CONFLICT(account_id) DO UPDATE SET epoch = epoch + 1;
+                        UPDATE account_viewer_impression_tasks
+                        SET status = 'cancelled', execution_token = NULL, lease_expires_at = NULL,
+                            evidence_snapshot = NULL, error_code = 'memory_disabled', error_detail = NULL
+                        WHERE account_id = {account_expr}
+                          AND status IN ('pending', 'processing', 'failed_retryable');
+                        DELETE FROM account_viewer_impressions WHERE account_id = {account_expr};
+                    END
+                """)
+            # Privacy cleanup must cover every existing completion, permanent
+            # failure, opt-out, purge and account-deletion path. Triggers keep
+            # checkpoint lifetime tied to raw snapshot lifetime even where an
+            # older caller clears tasks directly. SQLite foreign_keys is not
+            # assumed to be enabled by all callers.
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS impression_stages_snapshot_cleanup
+                AFTER UPDATE OF evidence_snapshot, status ON account_viewer_impression_tasks
+                WHEN NEW.evidence_snapshot IS NULL OR NEW.status IN ('cancelled', 'failed', 'completed')
+                BEGIN
+                    DELETE FROM account_viewer_impression_stages WHERE task_id = NEW.task_id;
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS impression_stages_task_cleanup
+                AFTER DELETE ON account_viewer_impression_tasks
+                BEGIN
+                    DELETE FROM account_viewer_impression_stages WHERE task_id = OLD.task_id;
+                END
+            """)
+            cursor.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id) "
+                "VALUES ('viewer_impression_deep_reflection_v2')"
+            )
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS streamer_activity_sessions (
                     stream_session_id TEXT PRIMARY KEY,
                     activity_id TEXT NOT NULL,
@@ -2707,47 +2771,52 @@ class DatabaseManager:
 
     def delete_account_episodic_memory(self, account_id: str) -> None:
         with self._get_connection() as conn:
-            now = datetime.now(timezone.utc).isoformat()
-            candidate_rows = conn.execute(
-                "SELECT candidate_id FROM stream_memory_candidates WHERE account_id = ?", (account_id,)
+            self._delete_account_episodic_memory(conn, account_id)
+
+    @staticmethod
+    def _delete_account_episodic_memory(conn, account_id: str) -> None:
+        """Join the caller's privacy transaction; never commit a partial clear."""
+        now = datetime.now(timezone.utc).isoformat()
+        candidate_rows = conn.execute(
+            "SELECT candidate_id FROM stream_memory_candidates WHERE account_id = ?", (account_id,)
+        ).fetchall()
+        candidate_ids = [row["candidate_id"] for row in candidate_rows]
+        memory_rows = conn.execute(
+            "SELECT memory_id FROM stream_episodic_memories WHERE scope = 'account' AND account_id = ?",
+            (account_id,),
+        ).fetchall()
+        memory_ids = [row["memory_id"] for row in memory_rows]
+        conn.execute("DELETE FROM stream_episodic_memories WHERE scope = 'account' AND account_id = ?", (account_id,))
+        conn.execute("DELETE FROM stream_memory_candidates WHERE account_id = ?", (account_id,))
+        if candidate_ids:
+            candidate_id_set = set(candidate_ids)
+            task_rows = conn.execute(
+                "SELECT stream_session_id, status, candidate_ids_json FROM stream_memory_tasks "
+                "WHERE status IN ('pending', 'processing')"
             ).fetchall()
-            candidate_ids = [row["candidate_id"] for row in candidate_rows]
-            memory_rows = conn.execute(
-                "SELECT memory_id FROM stream_episodic_memories WHERE scope = 'account' AND account_id = ?",
-                (account_id,),
-            ).fetchall()
-            memory_ids = [row["memory_id"] for row in memory_rows]
-            conn.execute("DELETE FROM stream_episodic_memories WHERE scope = 'account' AND account_id = ?", (account_id,))
-            conn.execute("DELETE FROM stream_memory_candidates WHERE account_id = ?", (account_id,))
-            if candidate_ids:
-                candidate_id_set = set(candidate_ids)
-                task_rows = conn.execute(
-                    "SELECT stream_session_id, status, candidate_ids_json FROM stream_memory_tasks "
-                    "WHERE status IN ('pending', 'processing')"
-                ).fetchall()
-                for task in task_rows:
-                    task_ids = json.loads(task["candidate_ids_json"] or "[]")
-                    remaining = [item for item in task_ids if item not in candidate_id_set]
-                    if remaining == task_ids:
-                        continue
-                    if not remaining and task["status"] == "pending":
-                        conn.execute(
-                            "UPDATE stream_memory_tasks SET status = 'completed', candidate_ids_json = '[]', "
-                            "completed_at = ?, updated_at = ? WHERE stream_session_id = ?",
-                            (now, now, task["stream_session_id"]),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE stream_memory_tasks SET candidate_ids_json = ?, updated_at = ? "
-                            "WHERE stream_session_id = ?",
-                            (json.dumps(remaining, ensure_ascii=False), now, task["stream_session_id"]),
-                        )
-            if memory_ids:
-                patterns = [f"%{memory_id}%" for memory_id in memory_ids]
-                conn.execute(
-                    "DELETE FROM stream_reflections WHERE " + " OR ".join("notable_event_ids_json LIKE ?" for _ in patterns),
-                    patterns,
-                )
+            for task in task_rows:
+                task_ids = json.loads(task["candidate_ids_json"] or "[]")
+                remaining = [item for item in task_ids if item not in candidate_id_set]
+                if remaining == task_ids:
+                    continue
+                if not remaining and task["status"] == "pending":
+                    conn.execute(
+                        "UPDATE stream_memory_tasks SET status = 'completed', candidate_ids_json = '[]', "
+                        "completed_at = ?, updated_at = ? WHERE stream_session_id = ?",
+                        (now, now, task["stream_session_id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE stream_memory_tasks SET candidate_ids_json = ?, updated_at = ? "
+                        "WHERE stream_session_id = ?",
+                        (json.dumps(remaining, ensure_ascii=False), now, task["stream_session_id"]),
+                    )
+        if memory_ids:
+            patterns = [f"%{memory_id}%" for memory_id in memory_ids]
+            conn.execute(
+                "DELETE FROM stream_reflections WHERE " + " OR ".join("notable_event_ids_json LIKE ?" for _ in patterns),
+                patterns,
+            )
 
     def get_stream_episodic_memory_stats(self) -> Dict[str, Any]:
         """仅返回低基数运行指标，不包含账号、昵称、原文或候选 ID。"""
@@ -3572,6 +3641,10 @@ class DatabaseManager:
     def delete_account_persona_memory(self, account_id: str) -> None:
         """删除人物记忆但保留账号、认证会话和昵称身份历史。"""
         with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO account_viewer_impression_epochs(account_id, epoch) VALUES (?, 1)
+                ON CONFLICT(account_id) DO UPDATE SET epoch = epoch + 1
+            """, (account_id,))
             conn.execute(
                 "DELETE FROM account_audience_relationships WHERE account_id = ?",
                 (account_id,),
@@ -3611,8 +3684,10 @@ class DatabaseManager:
                     "DELETE FROM account_viewer_impressions WHERE account_id = ?",
                     (account_id,),
                 )
-        # P24 情景记忆与关系、长期片段同属人物记忆治理边界；安全状态不在此处清理。
-        self.delete_account_episodic_memory(account_id)
+            # One commit must publish the new privacy epoch and removal of ALL
+            # evidence together. A second transaction could admit a snapshot
+            # containing old episodes under the already advanced epoch.
+            self._delete_account_episodic_memory(conn, account_id)
 
     # ==================== 主播管理系统 ====================
 
@@ -3990,6 +4065,16 @@ class DatabaseManager:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_latest_account_viewer_impression_generation(self, account_id: str) -> Optional[Dict[str, Any]]:
+        """Public task projection only; never fetch raw or intermediate evidence."""
+        with self._get_connection() as conn:
+            row = conn.execute("""
+                SELECT task_id, status, requested_at, next_attempt_at
+                FROM account_viewer_impression_tasks WHERE account_id = ?
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
+            """, (account_id,)).fetchone()
+            return dict(row) if row else None
+
     def create_account_viewer_impression_task(
         self,
         *,
@@ -3999,10 +4084,17 @@ class DatabaseManager:
         evidence_cutoff_at: str,
         cooldown_days: int,
         max_pending_tasks: int,
+        expected_privacy_epoch: Optional[int] = None,
     ) -> Dict[str, Any]:
         """原子执行 active-task、冷却和容量检查并创建一条冻结快照任务。"""
         with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if expected_privacy_epoch is not None:
+                epoch = conn.execute(
+                    "SELECT epoch FROM account_viewer_impression_epochs WHERE account_id = ?", (account_id,)
+                ).fetchone()
+                if int(epoch[0] if epoch else 0) != expected_privacy_epoch:
+                    return {"status": "memory_disabled"}
             preference = conn.execute(
                 "SELECT long_term_memory_enabled FROM account_memory_preferences WHERE account_id = ?",
                 (account_id,),
@@ -4126,6 +4218,64 @@ class DatabaseManager:
                     "attempt_count": int(row["attempt_count"] or 0) + 1,
                 })
                 return claimed
+
+    def viewer_impression_execution_active(
+        self, *, task_id: str, account_id: str, execution_token: str, now: str
+    ) -> bool:
+        with self._get_connection() as conn:
+            return self._impression_execution_active(conn, task_id, account_id, execution_token, now)
+
+    @staticmethod
+    def _impression_execution_active(conn, task_id, account_id, execution_token, now) -> bool:
+        return conn.execute("""
+            SELECT 1 FROM account_viewer_impression_tasks t
+            JOIN account_memory_preferences p ON p.account_id = t.account_id
+            WHERE t.task_id = ? AND t.account_id = ? AND t.execution_token = ?
+              AND t.status = 'processing' AND t.evidence_snapshot IS NOT NULL
+              AND p.long_term_memory_enabled = 1
+              AND julianday(t.lease_expires_at) > julianday(?)
+        """, (task_id, account_id, execution_token, now)).fetchone() is not None
+
+    def load_viewer_impression_stages(
+        self, *, task_id: str, account_id: str, execution_token: str, now: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            conn.execute("BEGIN")
+            if not self._impression_execution_active(conn, task_id, account_id, execution_token, now):
+                return None
+            rows = conn.execute(
+                "SELECT stage_key, result_json FROM account_viewer_impression_stages WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            return {row["stage_key"]: json.loads(row["result_json"]) for row in rows}
+
+    def save_viewer_impression_stage(
+        self, *, task_id: str, account_id: str, execution_token: str,
+        stage_key: str, result: Dict[str, Any], now: str
+    ) -> bool:
+        # Internal checkpoint keys include bounded chunk/merge coordinates.
+        # Callers validate the stage model before persisting it.
+        if (not stage_key or len(stage_key) > 80
+                or not all(c.isascii() and (c.isalnum() or c in "_:-") for c in stage_key)):
+            raise ValueError("invalid_impression_stage_key")
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if len(encoded) > 500000:
+            raise ValueError("impression_checkpoint_too_large")
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._impression_execution_active(conn, task_id, account_id, execution_token, now):
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO account_viewer_impression_stages
+                (task_id, stage_key, result_json, created_at) VALUES (?, ?, ?, ?)
+            """, (task_id, stage_key, encoded, now))
+            # Stage results are immutable for a frozen task. Retrying a
+            # completed stage may read it but cannot replace it with new prose.
+            existing = conn.execute("""
+                SELECT result_json FROM account_viewer_impression_stages
+                WHERE task_id = ? AND stage_key = ?
+            """, (task_id, stage_key)).fetchone()
+            return existing[0] == encoded
 
     def renew_account_viewer_impression_task_lease(
         self,

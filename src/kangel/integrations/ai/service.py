@@ -7,8 +7,10 @@ import socket
 import time
 import urllib.request
 import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from config import settings
 from config.settings import AIProvider
@@ -22,15 +24,30 @@ logger = logging.getLogger(__name__)
 # 角色标识：调用方通过 role 选择供应商链，而非硬编码模型名。
 Role = str  # 包括回复、分析、记忆及可选 stream_director/viewer_impression 角色
 
+IMPRESSION_ROLES = frozenset({
+    "viewer_memory_archaeologist", "viewer_impression_synthesizer",
+    "viewer_impression", "viewer_impression_critic",
+})
+
 _VALID_ROLES = frozenset({
     "default", "qa_selector", "danmaku_selector", "impact_analysis", "intent_shadow",
     "moderation", "session_memory", "stream_director", "viewer_impression",
-})
+}) | IMPRESSION_ROLES
 
 # Do not rely on urllib's default ``Python-urllib/*`` User-Agent.  Some
 # OpenAI-compatible gateways reject that generic client signature at the WAF
 # layer before the request reaches their API implementation.
 _USER_AGENT = "KAngel-Server/0.1"
+
+# Impression requests can last minutes. They must not occupy the default
+# asyncio executor used by live reply HTTP/database work. The semaphore stays
+# held until the physical request finishes, even if its coroutine is cancelled.
+_IMPRESSION_HTTP_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="impression-http")
+_IMPRESSION_HTTP_SLOTS = threading.BoundedSemaphore(4)
+
+
+class AIBackgroundBusy(RuntimeError):
+    pass
 
 
 def _parse_hhmm(value: str) -> int:
@@ -90,7 +107,7 @@ class AIService:
         """根据角色获取模型；Viewer Impression 不允许静默回退普通主播模型。"""
         models = provider.models
         role_model = getattr(models, role, None)
-        if role == "viewer_impression":
+        if role in IMPRESSION_ROLES:
             return role_model or ""
         return role_model or models.default
 
@@ -110,6 +127,7 @@ class AIService:
                 "stream_director": settings.ai.stream_director_model or settings.ai.default_model,
                 "viewer_impression": settings.ai.viewer_impression_model,
             }
+            model_map.update({r: getattr(settings.ai, f"{r}_model") for r in IMPRESSION_ROLES})
             model = model_map.get(role, settings.ai.default_model)
             if not model:
                 # A role without an explicit model is intentionally unavailable
@@ -155,6 +173,7 @@ class AIService:
                 "stream_director": settings.ai.stream_director_model or settings.ai.default_model,
                 "viewer_impression": settings.ai.viewer_impression_model,
             }
+            model_map.update({r: getattr(settings.ai, f"{r}_model") for r in IMPRESSION_ROLES})
             return bool(model_map.get(role))
         for p in settings.ai.providers:
             if p.enabled and self._get_model_for_role(p, role):
@@ -180,6 +199,7 @@ class AIService:
             "stream_director": settings.ai.stream_director_timeout,
             "viewer_impression": settings.ai.viewer_impression_timeout,
         }
+        timeouts.update({r: getattr(settings.ai, f"{r}_timeout") for r in IMPRESSION_ROLES})
         roles: Dict[str, Any] = {}
         for role in sorted(_VALID_ROLES):
             roles[role] = {
@@ -207,6 +227,7 @@ class AIService:
         response_format: Optional[Dict[str, Any]],
         timeout: int,
         reasoning_effort: Optional[str] = None,
+        background: bool = False,
     ) -> Tuple[str, Optional[Dict[str, int]]]:
         """返回 (正文, token 用量)；用量缺失时第二项为 None（审计记为未上报）。"""
         if stream:
@@ -229,9 +250,18 @@ class AIService:
 
         # 兼容供应商对 JSON Schema 的实现并不统一；调用方会继续在后端校验。
         _ = response_format
-        data = await asyncio.to_thread(
-            self._post_json_sync, url, headers, payload, timeout
-        )
+        if background:
+            if not _IMPRESSION_HTTP_SLOTS.acquire(blocking=False):
+                raise AIBackgroundBusy("background_http_capacity")
+            try:
+                future = _IMPRESSION_HTTP_EXECUTOR.submit(self._post_json_sync, url, headers, payload, timeout)
+            except BaseException:
+                _IMPRESSION_HTTP_SLOTS.release()
+                raise
+            future.add_done_callback(lambda _: _IMPRESSION_HTTP_SLOTS.release())
+            data = await asyncio.wrap_future(future)
+        else:
+            data = await asyncio.to_thread(self._post_json_sync, url, headers, payload, timeout)
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ValueError("OpenAI-compatible 响应缺少 choices")
@@ -331,6 +361,13 @@ class AIService:
         # 延迟优化 v1 §2：这里是唯一同时覆盖成功与失败的收口，所以 attempt 级
         # 时序也挂在这里——一次逻辑调用回退几家，就会自然产生几条 attempt。
         record_attempt_current(role=role, status=status, latency_ms=latency_ms)
+        if role in IMPRESSION_ROLES:
+            try:
+                from kangel.memory.application.impression_metrics import impression_stage_metrics
+                impression_stage_metrics.attempt(role=role, provider=provider, model=model,
+                                                 status=status, latency_ms=latency_ms, usage=usage)
+            except Exception:
+                logger.debug("Impression stage aggregate audit unavailable")
 
     async def run(
         self,
@@ -343,6 +380,7 @@ class AIService:
         response_format: Optional[Dict[str, Any]] = None,
         stream: bool = False,
         timeout: Optional[int] = None,
+        background_preflight: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """调用模型生成回复。
 
@@ -363,6 +401,8 @@ class AIService:
 
         # 显式 model 仍走旧单供应商路径（向后兼容）
         if model is not None and model_mode != "role_hint":
+            if role in IMPRESSION_ROLES and background_preflight is not None:
+                await background_preflight()
             started = time.perf_counter()
             try:
                 reply, usage = await self._call_model(
@@ -375,6 +415,7 @@ class AIService:
                     response_format=response_format,
                     timeout=effective_timeout,
                     reasoning_effort=None,
+                    background=role in IMPRESSION_ROLES,
                 )
             except Exception as exc:
                 self._audit(
@@ -401,6 +442,14 @@ class AIService:
 
         last_error: Optional[Exception] = None
         for provider, model_name in candidates:
+            if role in IMPRESSION_ROLES:
+                # A foreground reply/SC may arrive while the previous provider
+                # is timing out. Recheck before fallback, outside provider error
+                # handling: yielding is not another failed model attempt.
+                if background_preflight is not None:
+                    await background_preflight()
+                if not self._is_provider_active(provider):
+                    continue
             started = time.perf_counter()
             try:
                 reply, usage = await self._call_model(
@@ -413,6 +462,7 @@ class AIService:
                     response_format=response_format,
                     timeout=effective_timeout,
                     reasoning_effort=self._reasoning_effort(provider, role),
+                    background=role in IMPRESSION_ROLES,
                 )
                 self._audit(
                     role=role, provider=provider.name, model=model_name,
@@ -425,6 +475,10 @@ class AIService:
                     "message_id": str(uuid.uuid4()),
                     "usage": usage,
                 }
+            except AIBackgroundBusy:
+                # Local capacity is not provider failure: never fan out more
+                # fallback attempts while all background sockets are occupied.
+                raise
             except Exception as exc:
                 last_error = exc
                 # 每次尝试各记一行：带回退的调用能直接看出重试成本。

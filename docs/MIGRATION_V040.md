@@ -25,7 +25,10 @@ It remains unavailable until both the feature and a dedicated model are configur
 
 ```dotenv
 VIEWER_IMPRESSION__ENABLED=True
+AI__VIEWER_MEMORY_ARCHAEOLOGIST_MODEL=replace-with-a-dedicated-model
+AI__VIEWER_IMPRESSION_SYNTHESIZER_MODEL=replace-with-a-dedicated-model
 AI__VIEWER_IMPRESSION_MODEL=replace-with-a-dedicated-model
+AI__VIEWER_IMPRESSION_CRITIC_MODEL=replace-with-a-dedicated-model
 ```
 
 For multi-provider configurations, each eligible provider must explicitly map the role:
@@ -34,13 +37,16 @@ For multi-provider configurations, each eligible provider must explicitly map th
 {
   "models": {
     "default": "reply-model",
-    "viewer_impression": "dedicated-impression-model"
+    "viewer_memory_archaeologist": "dedicated-archaeologist-model",
+    "viewer_impression_synthesizer": "dedicated-synthesizer-model",
+    "viewer_impression": "dedicated-impression-model",
+    "viewer_impression_critic": "dedicated-critic-model"
   }
 }
 ```
 
-The `viewer_impression` role never falls back to the ordinary reply model. Worker lifecycle
-settings require a process restart. The default successful-generation cooldown is seven days;
+All four Deep Reflection v2 roles are explicit and never fall back to the ordinary reply model.
+Worker lifecycle settings require a process restart. The default successful-generation cooldown is seven days;
 failed or retryable attempts do not consume that cooldown, and a failed replacement leaves the
 previous letter intact.
 

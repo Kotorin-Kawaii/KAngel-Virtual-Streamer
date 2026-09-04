@@ -19,11 +19,16 @@ from config import settings
 from kangel.integrations.ai.persona.constitution import build_persona_system_prompt
 from kangel.integrations.ai.service import AIService, ai_service
 from kangel.infrastructure.database import DatabaseManager, db_manager
+from kangel.infrastructure.impression_candidates import ImpressionCandidateReader, ImpressionMemoryDisabled
 from kangel.shared.logging import logger
 from .runtime import account_memory_policy
+from ..domain.policy import AccountMemoryPolicy
+from .impression_evidence import SCHEMA_VERSION, build_evidence_snapshot, evidence_index
+from .impression_pipeline import DeepReflectionPipeline, ImpressionDeferred, ImpressionExecutionLost
 
 
-VIEWER_IMPRESSION_VERSION = "viewer_impression_v1"
+VIEWER_IMPRESSION_VERSION = SCHEMA_VERSION
+LEGACY_VIEWER_IMPRESSION_VERSION = "viewer_impression_v1"
 _FORBIDDEN_OUTPUT_TERMS = (
     "account_id", "user_id", "username", "password", "token", "user-agent",
     "moderation", "sponsor", "payment", "provider", "reasoning", "evidence_",
@@ -93,6 +98,15 @@ def _safe_memory_text(value: Any, limit: int) -> str:
     for pattern, replacement in _EVIDENCE_SENSITIVE_PATTERNS:
         text = pattern.sub(replacement, text)
     return text[: max(0, int(limit))]
+
+
+def _safe_reflection_text(value: Any, limit: int) -> str:
+    # Unlike live recall, archaeology must not truncate every retained topic to
+    # the live 500-character budget before the large-context stage sees it.
+    text = AccountMemoryPolicy(max_text_length=limit).prepare_text(str(value or "")) or ""
+    for pattern, replacement in _EVIDENCE_SENSITIVE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text[:limit]
 
 
 def _safe_detail(value: Any, limit: int = 320) -> str:
@@ -281,7 +295,44 @@ class ViewerImpressionService:
             "failed": 0,
         }
 
+    def _generation_mode(self) -> str | None:
+        core = ("viewer_memory_archaeologist", "viewer_impression_synthesizer", "viewer_impression")
+        if all(self.ai_client.has_role(role) for role in core):
+            if self.ai_client.has_role("viewer_impression_critic") or settings.viewer_impression.allow_without_critic:
+                return "v2"
+            return None
+        if settings.viewer_impression.allow_v1_fallback and self.ai_client.has_role("viewer_impression"):
+            return "v1"
+        return None
+
     def _snapshot(self, account_id: str, cutoff_at: str) -> dict[str, Any]:
+        config = settings.viewer_impression
+        try:
+            pool = ImpressionCandidateReader(self.database).read(
+                account_id, cutoff=cutoff_at, fragment_limit=config.max_fragment_candidates,
+                topic_limit=config.max_topic_candidates, episodic_limit=config.max_episodic_candidates,
+                nickname_limit=config.max_nickname_history,
+            )
+        except ImpressionMemoryDisabled:
+            raise ViewerImpressionError("memory_disabled", "请先开启长期记忆") from None
+        if (len(pool["conversation_fragments"]) < config.min_conversation_fragments
+                and len(pool["topic_memories"]) < config.min_topic_memories
+                and not pool["episodic_memories"]):
+            raise ViewerImpressionError("insufficient_memory", "还没有足够的长期互动记录")
+        snapshot = build_evidence_snapshot(pool, cutoff_at=cutoff_at,
+                                           stable_persona=build_persona_system_prompt(),
+                                           sanitize=_safe_reflection_text)
+        snapshot["privacy_epoch"] = pool["privacy_epoch"]
+        # Freeze partition/budget policy too: a restart/config change must not
+        # reinterpret checkpoint archaeology:0 as a different chunk of history.
+        snapshot["pipeline_config"] = {key: getattr(config, key) for key in (
+            "archaeologist_max_prompt_chars", "synthesizer_max_prompt_chars",
+            "writer_max_prompt_chars", "critic_max_prompt_chars", "max_archaeology_chunks",
+            "stage_output_chars", "max_repair_passes", "allow_without_critic", "max_output_chars",
+        )}
+        return snapshot
+
+    def _legacy_snapshot(self, account_id: str, cutoff_at: str) -> dict[str, Any]:
         preference = self.database.get_account_memory_preference(account_id)
         if not preference.get("long_term_memory_enabled"):
             raise ViewerImpressionError("memory_disabled", "请先开启长期记忆")
@@ -344,7 +395,7 @@ class ViewerImpressionService:
                 "occurred_at": str(item.get("occurred_at") or "")[:40],
             })
         snapshot = {
-            "schema_version": VIEWER_IMPRESSION_VERSION,
+            "schema_version": LEGACY_VIEWER_IMPRESSION_VERSION,
             "evidence_cutoff_at": cutoff_at,
             "stable_persona": build_persona_system_prompt(),
             "relationship": relationship_summary,
@@ -362,7 +413,7 @@ class ViewerImpressionService:
         memory_enabled = bool(
             self.database.get_account_memory_preference(account_id).get("long_term_memory_enabled")
         )
-        role_available = self.ai_client.has_role("viewer_impression") if feature_enabled else False
+        role_available = self._generation_mode() is not None if feature_enabled else False
         if not feature_enabled or not memory_enabled or not role_available:
             if not memory_enabled:
                 reason = "memory_disabled"
@@ -399,10 +450,14 @@ class ViewerImpressionService:
                 can_request = datetime.fromisoformat(next_request_at) <= datetime.fromisoformat(now_text)
             except (TypeError, ValueError):
                 can_request = True
+        latest = self.database.get_latest_account_viewer_impression_generation(account_id)
+        # Keep top-level ready/empty stable (and the old letter visible), while
+        # letting clients distinguish an exhausted attempt from "never asked".
+        generation = latest if latest and latest["status"] == "failed" else None
         return {
             "status": "ready" if current else "empty",
             "letter": letter,
-            "generation": None,
+            "generation": generation,
             "can_request": can_request,
             "next_request_at": next_request_at,
         }
@@ -415,7 +470,8 @@ class ViewerImpressionService:
         if not preference.get("long_term_memory_enabled"):
             self._stats["memory_disabled"] += 1
             raise ViewerImpressionError("memory_disabled", "请先开启长期记忆")
-        if not self.ai_client.has_role("viewer_impression"):
+        mode = self._generation_mode()
+        if mode is None:
             self._stats["unavailable"] += 1
             raise ViewerImpressionError("unavailable", "Viewer Impression 没有可用的专用模型角色")
         # Idempotent retries should return the existing task before rebuilding
@@ -431,10 +487,12 @@ class ViewerImpressionService:
                 "existing_task": True,
             }
         cutoff_at = _iso()
-        snapshot = self._snapshot(account_id, cutoff_at)
-        snapshot, _messages = ViewerImpressionPromptBuilder.build_budgeted(
-            snapshot, settings.viewer_impression.max_prompt_chars
-        )
+        if mode == "v2":
+            snapshot = self._snapshot(account_id, cutoff_at)
+        else:
+            snapshot, _messages = ViewerImpressionPromptBuilder.build_budgeted(
+                self._legacy_snapshot(account_id, cutoff_at), settings.viewer_impression.max_prompt_chars
+            )
         encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
         result = self.database.create_account_viewer_impression_task(
             account_id=account_id,
@@ -443,6 +501,7 @@ class ViewerImpressionService:
             evidence_cutoff_at=cutoff_at,
             cooldown_days=settings.viewer_impression.cooldown_days,
             max_pending_tasks=settings.viewer_impression.max_pending_tasks,
+            expected_privacy_epoch=snapshot.get("privacy_epoch"),
         )
         status = result.get("status")
         if status == "pending":
@@ -470,12 +529,6 @@ class ViewerImpressionService:
     async def process_once(self) -> bool:
         if not settings.viewer_impression.enabled:
             return False
-        has_active_role = getattr(self.ai_client, "has_active_role", None)
-        if callable(has_active_role) and not has_active_role("viewer_impression"):
-            # A configured provider may be outside its active time window.  Do
-            # not claim the task or consume an attempt; the next worker pass
-            # will retry once a provider becomes active.
-            return False
         claimed = await asyncio.to_thread(
             self.database.claim_account_viewer_impression_task,
             now=_iso(),
@@ -495,28 +548,33 @@ class ViewerImpressionService:
             ),
             name=f"viewer-impression-lease-{task_id}",
         )
+        snapshot = {}
         try:
-            snapshot = json.loads(claimed.get("evidence_snapshot") or "{}")
-            if not isinstance(snapshot, dict):
+            parsed_snapshot = json.loads(claimed.get("evidence_snapshot") or "{}")
+            if not isinstance(parsed_snapshot, dict):
                 raise ViewerImpressionValidationError("invalid_snapshot", "证据快照格式错误")
-            has_active_role = getattr(self.ai_client, "has_active_role", None)
-            if callable(has_active_role) and not has_active_role("viewer_impression"):
-                await asyncio.to_thread(
-                    self.database.release_account_viewer_impression_task,
-                    task_id=task_id,
-                    execution_token=token,
-                    now=_iso(),
+            snapshot = parsed_snapshot
+            if snapshot.get("schema_version") == SCHEMA_VERSION:
+                result = await DeepReflectionPipeline(self.database, self.ai_client).generate(claimed, snapshot)
+            elif snapshot.get("schema_version") == LEGACY_VIEWER_IMPRESSION_VERSION:
+                # Existing frozen v1 tasks may finish after an upgrade. This is
+                # not a fallback for a new or partially executed v2 request.
+                has_active_role = getattr(self.ai_client, "has_active_role", None)
+                if callable(has_active_role) and not has_active_role("viewer_impression"):
+                    raise ImpressionDeferred("stage_provider_inactive")
+                result = await self.ai_client.run(
+                    messages=ViewerImpressionPromptBuilder.build(snapshot), role="viewer_impression",
+                    model_mode="role_hint", temperature=0.45,
+                    response_format={"type": "json_object"}, timeout=settings.ai.viewer_impression_timeout,
                 )
-                return False
-            result = await self.ai_client.run(
-                messages=ViewerImpressionPromptBuilder.build(snapshot),
-                role="viewer_impression",
-                model_mode="role_hint",
-                temperature=0.45,
-                response_format={"type": "json_object"},
-                timeout=settings.ai.viewer_impression_timeout,
-            )
+            else:
+                raise ViewerImpressionValidationError("invalid_snapshot_version")
             validated = ViewerImpressionValidator.parse(result.get("reply", ""))
+            if snapshot.get("schema_version") == SCHEMA_VERSION:
+                from .impression_models import validate_final_content
+                validate_final_content(validated["content"], evidence_index(snapshot),
+                                       min(settings.viewer_impression.max_output_chars,
+                                           snapshot["pipeline_config"]["max_output_chars"]))
             generated_at = _iso()
             next_request_at = (
                 datetime.fromisoformat(generated_at)
@@ -551,9 +609,16 @@ class ViewerImpressionService:
             if committed:
                 self._stats["completed"] += 1
             return committed
+        except ImpressionExecutionLost:
+            return False
+        except ImpressionDeferred:
+            await asyncio.to_thread(self.database.release_account_viewer_impression_task,
+                                    task_id=task_id, execution_token=token, now=_iso())
+            return False
         except Exception as exc:
             has_active_role = getattr(self.ai_client, "has_active_role", None)
-            if callable(has_active_role) and not has_active_role("viewer_impression"):
+            if (snapshot.get("schema_version") == LEGACY_VIEWER_IMPRESSION_VERSION
+                    and callable(has_active_role) and not has_active_role("viewer_impression")):
                 await asyncio.to_thread(
                     self.database.release_account_viewer_impression_task,
                     task_id=task_id,
@@ -575,7 +640,7 @@ class ViewerImpressionService:
                 execution_token=token,
                 now=_iso(),
                 error_code=error_code,
-                error_detail=_safe_detail(exc),
+                error_detail=error_code if snapshot.get("schema_version") == SCHEMA_VERSION else _safe_detail(exc),
                 retryable=retryable,
                 next_attempt_at=next_attempt,
             )
@@ -610,6 +675,9 @@ class ViewerImpressionService:
     def _validated_evidence_refs(
         snapshot: dict[str, Any], evidence_used: list[Any]
     ) -> list[str]:
+        if snapshot.get("schema_version") == SCHEMA_VERSION:
+            known = evidence_index(snapshot)
+            return list(dict.fromkeys(str(ref) for ref in evidence_used if str(ref) in known))[:24]
         known = {
             str(item.get("id"))
             for key in ("conversation_fragments", "topic_memories", "episodic_memories")
@@ -624,6 +692,7 @@ class ViewerImpressionService:
             "conversation_fragments": len(snapshot.get("conversation_fragments") or []),
             "topic_memories": len(snapshot.get("topic_memories") or []),
             "episodic_memories": len(snapshot.get("episodic_memories") or []),
+            "nickname_history": len(snapshot.get("nickname_history") or []),
             "relationship": int(bool(snapshot.get("relationship"))),
         }
 
@@ -639,10 +708,12 @@ class ViewerImpressionService:
         }
 
     def get_stats(self) -> dict[str, Any]:
+        from .impression_metrics import impression_stage_metrics
         return {
             "enabled": settings.viewer_impression.enabled,
             **self.database.get_viewer_impression_stats(),
             "service": dict(self._stats),
+            "deep_reflection": impression_stage_metrics.snapshot(),
         }
 
 
