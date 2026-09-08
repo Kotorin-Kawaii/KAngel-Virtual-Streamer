@@ -24,12 +24,22 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=1, max_length=128)
+
+
 class AccountResponse(BaseModel):
     account_id: str
     username: str
     nickname: str
     nickname_version: int = 1
     created_at: str
+
+
+class PasswordChangeResponse(BaseModel):
+    account: AccountResponse
+    reauthentication_required: bool = True
 
 
 class AuthTokenResponse(BaseModel):

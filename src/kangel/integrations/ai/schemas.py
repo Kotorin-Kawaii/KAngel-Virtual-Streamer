@@ -19,6 +19,8 @@ class TokenDayRow(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    reasoning_missing_calls: int = 0
     total_tokens: int = 0
     latency_ms_sum: int = 0
     cost_amount: float = 0.0
@@ -33,6 +35,8 @@ class TokenDailyTotals(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    reasoning_missing_calls: int = 0
     total_tokens: int = 0
     latency_ms_sum: int = 0
     cost_amount: float = 0.0
@@ -60,6 +64,8 @@ class TokenGroupRow(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    reasoning_missing_calls: int = 0
     total_tokens: int = 0
     latency_ms_sum: int = 0
     avg_latency_ms: int = 0
@@ -91,6 +97,8 @@ class TokenRecordRow(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
+    reasoning_tokens: Optional[int] = None
+    reasoning_tokens_reported: int = 0
     total_tokens: int = 0
     latency_ms: int = 0
     error_kind: Optional[str] = None

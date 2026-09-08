@@ -160,7 +160,52 @@ async function restoreBrowserSession(reconnectDanmaku) {
 }
 ```
 
-## 4. 修改昵称与昵称历史
+## 4. 修改密码
+
+`PATCH /auth/profile/password`
+
+该接口必须携带当前 access Cookie 或 `Authorization: Bearer <access_token>`。请求体如下：
+
+```json
+{
+  "current_password": "a-strong-password",
+  "new_password": "a-new-strong-password"
+}
+```
+
+两个密码字段长度均为 1–128 位；新密码还必须满足服务端 `AUTH__MIN_PASSWORD_LENGTH`（默认 8 位）。服务端只在当前密码验证成功后生成新随机盐并以 scrypt 保存。新密码不能与当前密码相同。
+
+成功状态码：`200 OK`
+
+```json
+{
+  "account": {
+    "account_id": "4fcd6163-5f63-43c2-ab7c-1b8d0db32677",
+    "username": "alice_01",
+    "nickname": "小爱",
+    "nickname_version": 1,
+    "created_at": "2026-07-02T04:00:00+00:00"
+  },
+  "reauthentication_required": true
+}
+```
+
+修改成功会原子撤销该账号所有 access/refresh 会话，并通过 `Max-Age=0` 清理当前浏览器 Cookie；接口不会签发新令牌，前端必须回到登录页。旧设备也必须使用新密码重新登录。
+
+| 状态码 | 场景 | `detail` 示例 |
+|---|---|---|
+| `400 Bad Request` | 新密码与当前密码相同 | `新密码不能与当前密码相同` |
+| `401 Unauthorized` | 登录状态失效，或当前密码错误 | `当前密码不正确` |
+| `422 Unprocessable Entity` | 字段缺失、长度或密码策略不合法 | Pydantic 校验详情或密码策略说明 |
+| `429 Too Many Requests` | 账号/IP/全局限流或渐进失败冷却 | `RateLimitError` |
+
+错误响应不会包含密码、哈希、令牌或其他凭据。该接口没有自动找回密码能力。
+
+## 5. 忘记密码人工兜底
+
+当前不提供重置 API、邮箱/手机找回或后台自助重置。前端可以引导用户加入交流群 `1015206230` 联系管理员人工处理；用户不应发送密码、登录令牌或其他敏感信息。
+
+## 6. 修改昵称与昵称历史
 
 以下接口必须携带登录 Cookie，或者使用请求头：
 
@@ -168,7 +213,7 @@ async function restoreBrowserSession(reconnectDanmaku) {
 Authorization: Bearer <access_token>
 ```
 
-### 3.1 修改当前昵称
+### 6.1 修改当前昵称
 
 `PATCH /auth/profile/nickname`
 
@@ -196,7 +241,7 @@ Authorization: Bearer <access_token>
 
 错误状态：未登录或令牌失效返回 `401`；昵称格式错误返回 `422`。
 
-### 3.2 查询自己的昵称历史
+### 6.2 查询自己的昵称历史
 
 `GET /auth/profile/nickname-history`
 
@@ -226,7 +271,7 @@ Authorization: Bearer <access_token>
 
 只能读取令牌所属账号的历史，接口不接受客户端指定 `account_id`。
 
-### 3.3 删除自己的旧昵称
+### 6.3 删除自己的旧昵称
 
 `DELETE /auth/profile/nickname-history/{version}`
 
@@ -240,7 +285,7 @@ Authorization: Bearer <access_token>
 
 主播仅会获得一次“该登录观众近期改过名”的提示，默认有效期为 14 天。为了避免在公开直播中暴露隐私，旧昵称原文不会进入 AI 回复提示；主播可以自然注意到改名，但不能念出或猜测旧名。
 
-## 5. 人物记忆与隐私控制
+## 7. 人物记忆与隐私控制
 
 登录用户可以查询、导出、清除或关闭人物长期记忆。完整请求、响应及脱敏规则见 [账号人物记忆与隐私接口](../concepts/MEMORY_PRIVACY.md)。
 
@@ -253,7 +298,7 @@ Authorization: Bearer <access_token>
 
 这些接口只能操作当前访问令牌所属账号，不能由客户端传入其他 `account_id`。
 
-## 6. 携带登录身份连接弹幕 WebSocket
+## 8. 携带登录身份连接弹幕 WebSocket
 
 ### 浏览器推荐方式：HttpOnly Cookie
 
@@ -293,7 +338,7 @@ const ws = new WebSocket(
 
 对于登录连接，服务端以账号记录中的昵称为准，忽略弹幕负载中伪造或过期的昵称；对于游客连接，仍使用消息中的昵称。弹幕负载中的 `account_id` 或 `user_id` 字段不会被信任。
 
-## 7. 游客连接
+### 8.1 游客连接
 
 不传令牌即可保持原有行为：
 
@@ -303,7 +348,7 @@ const ws = new WebSocket("ws://localhost:8000/danmaku");
 
 游客会获得仅在当前连接有效的临时身份。相同昵称的不同游客不会共享账号关系，也不会自动继承旧昵称数据。
 
-## 8. 前端保存建议
+## 9. 前端保存建议
 
 1. 同源浏览器只使用服务端设置的 `HttpOnly` access/refresh Cookie，不要由 JavaScript 复制、缓存或持久化任何令牌。
 2. 生产环境必须使用 HTTPS/WSS，并设置 `AUTH__COOKIE_SECURE=true`。
@@ -312,9 +357,9 @@ const ws = new WebSocket("ws://localhost:8000/danmaku");
 5. `account_id` 仅用于前端关联账号数据，不能替代访问令牌进行认证。
 6. 登录账号只能通过 `PATCH /auth/profile/nickname` 改名，不要通过弹幕字段尝试修改昵称。
 
-## 8. 当前安全边界与后续项
+## 10. 当前安全边界与后续项
 
 - 密码以 scrypt + 每账号随机盐保存。
 - 数据库仅保存 access/refresh 令牌的 SHA-256 摘要，不保存令牌明文。
 - 账号 ID 为不可变 UUID；用户名和昵称都不是记忆归属键。
-- 当前尚未提供登出、令牌主动吊销、密码修改、找回密码和登录限流；这些属于账号系统后续增强项。
+- 当前仍未提供独立登出接口、自动找回密码或邮箱/手机绑定；修改密码会撤销该账号全部现有会话，登录和修改密码入口均有应用内限流。

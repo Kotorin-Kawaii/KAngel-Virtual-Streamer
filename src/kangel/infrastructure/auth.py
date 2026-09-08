@@ -23,6 +23,14 @@ class InvalidCredentialsError(ValueError):
     pass
 
 
+class CurrentPasswordInvalidError(InvalidCredentialsError):
+    pass
+
+
+class SamePasswordError(ValueError):
+    pass
+
+
 class InvalidRefreshTokenError(ValueError):
     pass
 
@@ -61,11 +69,33 @@ class AuthService:
             # 对不存在账号执行一次等成本哈希，降低用户名枚举时序差异。
             self._hash_password(password, bytes(16))
             raise InvalidCredentialsError("用户名或密码错误")
-        salt = base64.b64decode(account["password_salt"])
-        actual_hash = self._hash_password(password, salt)
-        if not hmac.compare_digest(actual_hash, account["password_hash"]):
+        if not self._verify_password(account, password):
             raise InvalidCredentialsError("用户名或密码错误")
         return self._issue_token_pair(account)
+
+    def change_password(
+        self, account_id: str, current_password: str, new_password: str
+    ) -> dict:
+        """校验当前密码后原子替换密码，并撤销账号全部已有会话。"""
+        account = self.database.get_account_by_id(account_id)
+        if not account or not bool(account.get("login_enabled", 1)):
+            raise CurrentPasswordInvalidError("当前密码不正确")
+        if not self._verify_password(account, current_password):
+            raise CurrentPasswordInvalidError("当前密码不正确")
+        self._validate_password(new_password)
+        if self._verify_password(account, new_password):
+            raise SamePasswordError("新密码不能与当前密码相同")
+
+        salt = secrets.token_bytes(16)
+        updated = self.database.update_account_password_and_revoke_sessions(
+            account_id=account_id,
+            password_salt=base64.b64encode(salt).decode("ascii"),
+            password_hash=self._hash_password(new_password, salt),
+            changed_at=self._now(),
+        )
+        if not updated:
+            raise CurrentPasswordInvalidError("当前密码不正确")
+        return self._account_payload(updated)
 
     def authenticate_access_token(
         self, access_token: str
@@ -119,6 +149,26 @@ class AuthService:
             "token_type": "bearer",
             "expires_at": access_expires_at.isoformat(),
         }
+
+    def logout(self, access_token: str = "", refresh_token: str = "") -> bool:
+        """撤销当前客户端携带的会话令牌；重复调用保持幂等。"""
+        access_token_hash = (
+            self._hash_token(access_token)
+            if access_token and len(access_token) <= 512
+            else None
+        )
+        refresh_token_hash = (
+            self._hash_token(refresh_token)
+            if refresh_token and len(refresh_token) <= 512
+            else None
+        )
+        if not access_token_hash and not refresh_token_hash:
+            return False
+        return self.database.revoke_auth_tokens(
+            access_token_hash=access_token_hash,
+            refresh_token_hash=refresh_token_hash,
+            revoked_at=self._now(),
+        )
 
     def update_nickname(self, account_id: str, nickname: str) -> dict:
         normalized = self._normalize_nickname(nickname)
@@ -205,6 +255,15 @@ class AuthService:
             raise ValueError(
                 f"密码长度必须为 {settings.auth.min_password_length}-128 位"
             )
+
+    def _verify_password(self, account: dict, password: str) -> bool:
+        try:
+            salt = base64.b64decode(account["password_salt"])
+            actual_hash = self._hash_password(password, salt)
+        except (KeyError, TypeError, ValueError):
+            return False
+        stored_hash = account.get("password_hash", "")
+        return isinstance(stored_hash, str) and hmac.compare_digest(actual_hash, stored_hash)
 
     def _hash_password(self, password: str, salt: bytes) -> str:
         digest = hashlib.scrypt(

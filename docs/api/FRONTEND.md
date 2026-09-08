@@ -218,7 +218,7 @@ type LoginRequest = {
 
 错误：`401` 用户名不存在或密码错误，两者统一返回 `用户名或密码错误`；`422` 格式错误；`429 RateLimitError` 登录尝试过于频繁。
 
-当前没有登出、修改密码或找回密码接口。
+当前提供登出和修改密码接口；忘记密码仍需联系管理员人工处理。
 
 ### 4.3 刷新浏览器会话
 
@@ -234,6 +234,10 @@ type AuthRefreshResponse = {
 ```
 
 成功：`200 AuthRefreshResponse`，并重新设置两个 `HttpOnly` Cookie。响应不包含 access 或 refresh token。refresh Cookie 默认有效期 720 小时、Path 是 `/auth/refresh`，且为一次性令牌：每次成功刷新都会轮换，旧值立即失效。
+
+`POST /auth/logout`
+
+退出当前浏览器/客户端会话。服务端撤销请求中携带的 access/refresh 会话令牌，并返回两个 `Max-Age=0` 的 `HttpOnly` Cookie。接口幂等，即使令牌已经过期或缺失也返回 `204`；不会影响同一账号在其他设备上的登录。
 
 失败：`401` 表示 refresh Cookie 缺失、无效、过期或已经使用。`401` 以外的网络错误、`429` 或 `5xx` 不代表用户退出登录。
 
@@ -1951,7 +1955,7 @@ stores/chat.ts          Danmaku 与 AIReply，按 danmakuID 关联
 ### 8.3 当前后端缺口
 
 - 没有 `GET /auth/me`；刷新页面后的账号资料暂时可通过重新登录结果保存，或由前端 agent 与后端补充该接口后再实现可靠恢复。
-- 没有登出和令牌吊销接口。
+- `POST /auth/logout` 会撤销当前客户端携带的会话令牌并清除认证 Cookie；该操作不影响其他设备的登录。
 - CORS 已支持精确来源白名单、认证 Cookie、`Authorization/Content-Type` 请求头和 `OPTIONS` 预检；生产前端域名必须加入 `CORS__ALLOWED_ORIGINS`，仍优先推荐反向代理同源部署。
 - P4 排期、时区、开播边界和每日主题字段均已进入 `StreamMetadata`。
 - 内部管理/调试 HTTP 接口已默认关闭并使用独立管理员密钥；尚未提供面向浏览器的管理员登录流程，因此公开前端仍不得调用。

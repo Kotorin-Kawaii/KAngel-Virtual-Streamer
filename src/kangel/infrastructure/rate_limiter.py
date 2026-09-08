@@ -216,3 +216,4 @@ class ProgressiveCooldown:
 rate_limiter = InMemoryRateLimiter()
 concurrency_gate = ConcurrencyGate()
 login_failure_cooldown = ProgressiveCooldown()
+password_change_failure_cooldown = ProgressiveCooldown()

@@ -20,7 +20,8 @@ from .admin_ui import ADMIN_UI_HTML
 from .api_schemas import ServerStatus, RootResponse, ConfigResponse, ConfigUpdateRequest
 from .auth_schemas import (
     RegisterRequest, LoginRequest, AuthTokenResponse, AuthRefreshResponse, AccountResponse,
-    NicknameUpdateRequest, NicknameHistoryResponse,
+    NicknameUpdateRequest, NicknameHistoryResponse, PasswordChangeRequest,
+    PasswordChangeResponse,
     RateLimitErrorResponse,
 )
 from .schemas import (
@@ -64,7 +65,7 @@ from kangel.audience.application.presence_service import viewer_presence_coordin
 from kangel.persona.domain.events import DanmakuReceivedEvent, StreamLifecycleEvent
 from kangel.infrastructure.auth import (
     auth_service, UsernameAlreadyExistsError, InvalidCredentialsError,
-    InvalidRefreshTokenError,
+    InvalidRefreshTokenError, CurrentPasswordInvalidError, SamePasswordError,
 )
 from kangel.infrastructure.bounded_work_gate import ai_reply_work_gate
 from kangel.memory.application.governance import account_memory_governance_service
@@ -95,7 +96,8 @@ from kangel.moderation.application.coordinator import moderation_coordinator
 from kangel.infrastructure.security_metrics import security_metrics
 from kangel.infrastructure.overload_protection import overload_protector
 from kangel.infrastructure.rate_limiter import (
-    RateLimitPolicy, concurrency_gate, login_failure_cooldown, rate_limiter,
+    RateLimitPolicy, concurrency_gate, login_failure_cooldown,
+    password_change_failure_cooldown, rate_limiter,
 )
 from kangel.infrastructure.realtime_protection import (
     ProtectionDecision, danmaku_deduplicator, resolve_client_ip,
@@ -109,6 +111,7 @@ from .dependencies import (
     http_access_token as _http_access_token,
     require_http_principal,
     set_auth_cookie as _set_auth_cookie,
+    clear_auth_cookies as _clear_auth_cookies,
     websocket_access_token as _websocket_access_token,
 )
 
@@ -402,6 +405,7 @@ def _rate_limit_response(scope: str, retry_after_seconds: int) -> JSONResponse:
     metric_scope = (
         "auth_register" if scope.startswith("auth_register")
         else "auth_login" if scope.startswith("auth_login")
+        else "auth_password_change" if scope.startswith("auth_password_change")
         else "account_profile" if scope.startswith("account_profile")
         else "http"
     )
@@ -427,6 +431,10 @@ def _login_failure_key(request: Request, username: str) -> str:
     return f"{_client_ip(request)}:{_username_limit_key(username)}"
 
 
+def _password_change_failure_key(request: Request, account_id: str) -> str:
+    return f"{_client_ip(request)}:{account_id}"
+
+
 def _enforce_profile_rate_limit(account_id: str, *, write: bool) -> JSONResponse | None:
     config = settings.rate_limit
     decision = rate_limiter.check(
@@ -446,7 +454,7 @@ def _enforce_profile_rate_limit(account_id: str, *, write: bool) -> JSONResponse
 
 
 def _enforce_auth_rate_limit(
-    request: Request, *, action: str, username: str = ""
+    request: Request, *, action: str, username: str = "", account_id: str = ""
 ) -> JSONResponse | None:
     if not settings.rate_limit.enabled:
         return None
@@ -467,6 +475,22 @@ def _enforce_auth_rate_limit(
             )),
         ]
         public_scope = "auth_register"
+    elif action == "password_change":
+        checks = [
+            (f"auth:password_change:ip:{ip}", _limit_policy(
+                config.password_change_ip_rate_per_minute,
+                config.password_change_ip_burst,
+            )),
+            (f"auth:password_change:account:{account_id}", _limit_policy(
+                config.password_change_account_rate_per_minute,
+                config.password_change_account_burst,
+            )),
+            ("auth:password_change:global", _limit_policy(
+                config.password_change_global_rate_per_minute,
+                config.password_change_global_burst,
+            )),
+        ]
+        public_scope = "auth_password_change"
     else:
         username_key = _username_limit_key(username)
         checks = [
@@ -492,6 +516,12 @@ def _enforce_auth_rate_limit(
     if action == "login":
         progressive = login_failure_cooldown.check(
             _login_failure_key(request, username)
+        )
+        if not progressive.allowed:
+            return _rate_limit_response(public_scope, progressive.retry_after_seconds)
+    elif action == "password_change":
+        progressive = password_change_failure_cooldown.check(
+            _password_change_failure_key(request, account_id)
         )
         if not progressive.allowed:
             return _rate_limit_response(public_scope, progressive.retry_after_seconds)
@@ -569,6 +599,77 @@ async def login_account(payload: LoginRequest, response: Response, request: Requ
             max_seconds=settings.rate_limit.login_failure_max_cooldown_seconds,
         )
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    finally:
+        lease.release()
+
+
+@router.post(
+    "/auth/logout",
+    status_code=204,
+    responses={204: {"description": "已退出当前登录会话"}},
+)
+async def logout_account(response: Response, request: Request):
+    """撤销当前 access/refresh 会话并清除浏览器认证 Cookie。
+
+    退出接口故意保持幂等：即使会话已过期或只剩部分 Cookie，也始终清理客户端状态。
+    """
+    await asyncio.to_thread(
+        auth_service.logout,
+        _http_access_token(request),
+        request.cookies.get(settings.auth.refresh_cookie_name, ""),
+    )
+    _clear_auth_cookies(response)
+    response.status_code = 204
+    return response
+
+
+@router.patch(
+    "/auth/profile/password",
+    response_model=PasswordChangeResponse,
+    responses={
+        400: {"description": "新密码不能与当前密码相同"},
+        401: {"description": "当前密码不正确或登录状态已过期"},
+        429: {"model": RateLimitErrorResponse, "description": "修改密码请求过于频繁"},
+    },
+)
+async def change_account_password(
+    payload: PasswordChangeRequest, response: Response, request: Request
+):
+    """修改当前账号密码；成功后撤销该账号全部会话并要求重新登录。"""
+    principal = await _require_http_principal(request)
+    limited = _enforce_auth_rate_limit(
+        request, action="password_change", account_id=principal.account_id
+    )
+    if limited:
+        return limited
+    lease = concurrency_gate.try_acquire(
+        "auth:password_change_hash", settings.rate_limit.password_change_hash_concurrency
+    )
+    if lease is None:
+        return _rate_limit_response("auth_password_change_capacity", 1)
+    failure_key = _password_change_failure_key(request, principal.account_id)
+    try:
+        account = await asyncio.to_thread(
+            auth_service.change_password,
+            principal.account_id,
+            payload.current_password,
+            payload.new_password,
+        )
+        password_change_failure_cooldown.clear(failure_key)
+        _clear_auth_cookies(response)
+        return {"account": account, "reauthentication_required": True}
+    except CurrentPasswordInvalidError as exc:
+        password_change_failure_cooldown.record_failure(
+            failure_key,
+            threshold=settings.rate_limit.password_change_failure_threshold,
+            base_seconds=settings.rate_limit.password_change_failure_base_cooldown_seconds,
+            max_seconds=settings.rate_limit.password_change_failure_max_cooldown_seconds,
+        )
+        raise HTTPException(status_code=401, detail="当前密码不正确") from exc
+    except SamePasswordError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     finally:
         lease.release()
 

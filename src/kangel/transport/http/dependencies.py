@@ -53,6 +53,22 @@ def set_auth_cookie(response: Response, auth_result: dict) -> None:
     )
 
 
+def clear_auth_cookies(response: Response) -> None:
+    """让浏览器立即丢弃当前 access/refresh Cookie。"""
+    response.headers.append(
+        "set-cookie",
+        _build_set_cookie_header(
+            settings.auth.cookie_name, "", max_age=0, path="/"
+        ),
+    )
+    response.headers.append(
+        "set-cookie",
+        _build_set_cookie_header(
+            settings.auth.refresh_cookie_name, "", max_age=0, path="/auth/refresh"
+        ),
+    )
+
+
 def http_access_token(request: Request) -> str:
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")

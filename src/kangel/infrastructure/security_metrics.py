@@ -5,7 +5,7 @@ import threading
 
 
 _KNOWN_SCOPES = {
-    "http", "auth_register", "auth_login", "account_profile",
+    "http", "auth_register", "auth_login", "auth_password_change", "account_profile",
     "ws_handshake", "danmaku_send", "ai_reply", "connection",
     "broadcast", "database", "sc", "viewer_emote", "overload", "moderation",
 }

@@ -3730,6 +3730,43 @@ class DatabaseManager:
             ).fetchone()
             return dict(updated) if updated else None
 
+    def update_account_password_and_revoke_sessions(
+        self,
+        *,
+        account_id: str,
+        password_salt: str,
+        password_hash: str,
+        changed_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        """原子替换密码并撤销账号全部 access/refresh 会话。"""
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account = conn.execute(
+                "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+            if not account:
+                return None
+            conn.execute(
+                """UPDATE accounts
+                   SET password_salt = ?, password_hash = ?, updated_at = ?
+                 WHERE account_id = ?""",
+                (password_salt, password_hash, changed_at, account_id),
+            )
+            conn.execute(
+                """UPDATE auth_sessions SET revoked_at = ?
+                 WHERE account_id = ? AND revoked_at IS NULL""",
+                (changed_at, account_id),
+            )
+            conn.execute(
+                """UPDATE auth_refresh_sessions SET revoked_at = ?
+                 WHERE account_id = ? AND revoked_at IS NULL""",
+                (changed_at, account_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+            return dict(updated) if updated else None
+
     def get_recent_moderation_actions(
         self, subject_key: str, cutoff: str, limit: int = 8
     ) -> List[Dict[str, Any]]:
@@ -4696,6 +4733,37 @@ class DatabaseManager:
                 session["token_hash"], session["account_id"],
                 session["created_at"], session["expires_at"],
             ))
+
+    def revoke_auth_tokens(
+        self,
+        *,
+        access_token_hash: Optional[str] = None,
+        refresh_token_hash: Optional[str] = None,
+        revoked_at: str,
+    ) -> bool:
+        """撤销当前请求携带的 access/refresh 会话令牌。
+
+        退出登录只影响当前浏览器/客户端会话，不会撤销账号在其他设备上的登录。
+        令牌为空时不执行对应更新，使退出接口可以安全地幂等调用。
+        """
+        changed = False
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if access_token_hash:
+                cursor = conn.execute(
+                    """UPDATE auth_sessions SET revoked_at = ?
+                       WHERE token_hash = ? AND revoked_at IS NULL""",
+                    (revoked_at, access_token_hash),
+                )
+                changed = changed or cursor.rowcount > 0
+            if refresh_token_hash:
+                cursor = conn.execute(
+                    """UPDATE auth_refresh_sessions SET revoked_at = ?
+                       WHERE token_hash = ? AND revoked_at IS NULL""",
+                    (revoked_at, refresh_token_hash),
+                )
+                changed = changed or cursor.rowcount > 0
+        return changed
 
     def get_active_auth_session(self, token_hash: str, now: str) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
