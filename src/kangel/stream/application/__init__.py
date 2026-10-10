@@ -24,6 +24,12 @@ _MODULES = {
     "StreamSessionSummaryService": "session_summary",
     "StreamSessionSummaryConsumer": "session_summary",
     "UserActivity": "metadata",
+    "DeterministicLivePresencePolicy": "presence_policy",
+    "LivePresenceMetrics": "presence_metrics",
+    "LivePresenceService": "live_presence",
+    "LivePresenceShadowObservation": "live_presence",
+    "LivePresenceVersionConflict": "live_presence",
+    "live_presence_service": "live_presence",
 }
 __all__ = list(_MODULES)
 

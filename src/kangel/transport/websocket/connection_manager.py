@@ -12,6 +12,7 @@ from kangel.audience.application.identity_service import (
 )
 from config import settings
 from kangel.shared.logging import logger
+from kangel.shared.time import parse_timestamp_as_utc
 from kangel.infrastructure.security_metrics import security_metrics
 from .protocol import WebSocketEventType
 
@@ -260,6 +261,68 @@ class ConnectionManager:
             logger.debug(f"已向新用户 [ID: {connection.id[:8]}] 发送 {len(history_messages)} 条历史弹幕")
         except Exception as e:
             logger.error(f"发送历史弹幕失败 [ID: {connection.id[:8]}]: {e}")
+
+    async def restore_message_history(self, database, *, limit: Optional[int] = None) -> int:
+        """从 SQLite 恢复最近展示消息，供重启后的新连接回放。
+
+        恢复的是展示历史，不是普通弹幕的待处理池：旧消息不会因为部署重启
+        被重新送入 AI 回复选择器。SC 也只作为 ``type=sc`` 的展示消息恢复，
+        其履约仍由持久化 SC 队列消费者负责。
+        """
+        restore_limit = limit if limit is not None else settings.danmaku.max_history
+        try:
+            restore_limit = max(1, min(int(restore_limit), 500))
+        except (TypeError, ValueError):
+            restore_limit = settings.danmaku.max_history
+        try:
+            rows = await asyncio.to_thread(
+                database.get_recent_display_messages, restore_limit
+            )
+        except Exception:
+            logger.exception("从数据库恢复 WebSocket 弹幕历史失败")
+            return 0
+
+        restored = []
+        for row in reversed(rows):
+            danmaku_id = str(row.get("danmaku_id") or "").strip()
+            if not danmaku_id:
+                continue
+            restored.append({
+                "nickname": str(row.get("nickname") or ""),
+                "message": str(row.get("message") or ""),
+                "type": "sc" if row.get("type") == "sc" else "normal",
+                "timestamp": str(row.get("timestamp") or ""),
+                "danmakuID": danmaku_id,
+            })
+        if not restored:
+            return 0
+
+        async with self._lock:
+            # 兼容极早期连接管理器中已存在的消息，并以 ID 幂等去重。
+            by_id = {
+                str(item.get("danmakuID")): item
+                for item in self.message_history
+                if item.get("danmakuID")
+            }
+            restored_count = 0
+            for item in restored:
+                if item["danmakuID"] not in by_id:
+                    restored_count += 1
+                by_id[item["danmakuID"]] = item
+            ordered = sorted(
+                by_id.values(),
+                key=lambda item: (
+                    parse_timestamp_as_utc(
+                        item.get("timestamp"),
+                        naive_timezone=settings.stream.timezone,
+                    ),
+                    str(item.get("danmakuID") or ""),
+                ),
+            )
+            self.message_history.clear()
+            self.message_history.extend(ordered[-self.message_history.maxlen:])
+        logger.info("已从数据库恢复 %d 条 WebSocket 弹幕历史", restored_count)
+        return restored_count
     
     async def broadcast_message(self, message: DanmakuResponse):
         """记录并广播直播间展示消息；普通弹幕与 SC 共用展示历史。"""
@@ -332,17 +395,20 @@ class ConnectionManager:
             }
         }
     
-    async def broadcast_json(self, data: dict):
+    async def broadcast_json(self, data: dict, *, delivery_report: bool = False):
         """广播JSON数据给所有连接的客户端"""
         if not self.active_connections:
             return 0
         
         broadcast_str = json.dumps(data, ensure_ascii=False)
         disconnected_ids = set()
+        delivered = 0
         
         async def send_to_client(connection: WebSocketConnection):
+            nonlocal delivered
             try:
                 await connection.send_text(broadcast_str)
+                delivered += 1
             except Exception as e:
                 logger.error(f"广播数据失败 [ID: {connection.id[:8]}]: {e}")
                 security_metrics.record("broadcast", "send_failed")
@@ -365,7 +431,7 @@ class ConnectionManager:
                             self._ip_connection_map[client_ip].discard(cid)
                             if not self._ip_connection_map[client_ip]:
                                 del self._ip_connection_map[client_ip]
-        return len(disconnected_ids)
+        return delivered if delivery_report else len(disconnected_ids)
 
 
 connection_manager = ConnectionManager()

@@ -11,7 +11,7 @@ from typing import List, Dict, Set, Tuple, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
-from config.emotion_catalog import AVAILABLE_EMOTIONS
+from config.emotion_catalog import AVAILABLE_EMOTIONS, TEMPORARILY_DISABLED_EMOTIONS
 from config.settings import settings
 from kangel.shared.logging import logger
 
@@ -121,9 +121,16 @@ class EmotionManager:
             EmotionItem("宅系", EmotionCategory.NEUTRAL_ACTION, description="宅系风格的表现"),
         ]
 
-        if tuple(emotion.name for emotion in emotions) != AVAILABLE_EMOTIONS:
+        enabled_emotion_names = tuple(
+            emotion.name
+            for emotion in emotions
+            if emotion.name not in TEMPORARILY_DISABLED_EMOTIONS
+        )
+        if enabled_emotion_names != AVAILABLE_EMOTIONS:
             raise RuntimeError("情绪管理器定义与共享情绪目录不一致")
         for emotion in emotions:
+            if emotion.name in TEMPORARILY_DISABLED_EMOTIONS:
+                continue
             self._emotions[emotion.name] = emotion
     
     def set_randomness(self, randomness: float):
@@ -318,7 +325,7 @@ class EmotionManager:
         """按类别语气契合度分配名额，每类内部再取前几名。
 
         纯线性打分会让状态决定的同一簇永远占满推荐位（实测六种状态合计只能推出
-        18/34 个标定，全部中性动作永远垫底）。这里改成先给说得通的类别分名额，
+        18 个左右的启用标定，全部中性动作永远垫底）。这里改成先给说得通的类别分名额，
         再在类别内部取高分项：既保住语气正确，又让模型每轮都看到多种表达。
         """
         buckets: Dict[EmotionCategory, List[Tuple[float, str]]] = {}

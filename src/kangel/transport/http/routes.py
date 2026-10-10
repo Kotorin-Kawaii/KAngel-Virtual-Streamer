@@ -7,7 +7,7 @@ import time
 import unicodedata
 import uuid
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 from fastapi import (
@@ -38,6 +38,7 @@ from .schemas import (
     SponsorExpenseRequest, SponsorFundEntryResponse, SponsorFinanceSyncStatsResponse,
     SponsorTransparencyResponse,
 )
+from .schemas import PublicStatsResponse
 from kangel.transport.websocket.connection_manager import connection_manager
 from kangel.persona.application.engine import persona_engine
 from kangel.infrastructure.event_bus import event_bus
@@ -83,6 +84,7 @@ from kangel.integrations.sponsor.sync_worker import sponsor_sync_worker
 from kangel.integrations.sponsor.client import AfdianError
 from kangel.integrations.sponsor.finance import SponsorFinanceError, sponsor_finance_service
 from kangel.integrations.sponsor.finance_sync_worker import sponsor_finance_sync_worker
+from kangel.stream.application.public_stats import public_stats_service
 from kangel.integrations.ai import token_report
 from kangel.integrations.ai.service import ai_service
 from kangel.integrations.ai.schemas import (
@@ -216,6 +218,7 @@ async def _cleanup_websocket_connection(websocket: WebSocket) -> None:
     english_surprise_joke_service.forget_guest(identity)
     await event_bus.emit("client_disconnected", websocket)
     stream_metadata_pusher.update_viewer_count(connection_manager.get_connection_count())
+    stream_metadata_pusher.notify_audience_presence()
     logger.info(f"客户端断开连接，当前连接数: {connection_manager.get_connection_count()}")
 
 
@@ -399,6 +402,122 @@ def _check_ai_reply_quota(selected) -> ProtectionDecision:
     return ProtectionDecision(
         False, "ai_reply", decision.retry_after_seconds, "cooldown", "quota_exceeded"
     )
+
+
+async def _complete_processing_claim_if_needed(
+    *, stream_session_id: str | None, danmaku_id: str, claim_token: str | None
+) -> None:
+    """Release a route-level preclaim on paths that never enter PersonaEngine."""
+    if not stream_session_id or not danmaku_id or not claim_token:
+        return
+    try:
+        await asyncio.to_thread(
+            db_manager.complete_danmaku_processing,
+            stream_session_id=str(stream_session_id),
+            source_type="normal",
+            danmaku_id=str(danmaku_id),
+            claim_token=str(claim_token),
+        )
+    except Exception as exc:
+        # A stale/failed cleanup must not break the WebSocket loop.  The claim
+        # lease still bounds recovery and this path never changes user-visible
+        # reply semantics.
+        logger.warning("普通弹幕 preclaim 清理失败: %s", exc)
+
+
+async def _release_processing_claim_if_needed(
+    *, stream_session_id: str | None, danmaku_id: str, claim_token: str | None
+) -> None:
+    """Release a non-terminal preclaim so a READ item can be retried later."""
+    if not stream_session_id or not danmaku_id or not claim_token:
+        return
+    try:
+        await asyncio.to_thread(
+            db_manager.release_danmaku_processing,
+            stream_session_id=str(stream_session_id),
+            source_type="normal",
+            danmaku_id=str(danmaku_id),
+            claim_token=str(claim_token),
+        )
+    except Exception as exc:
+        logger.warning("普通弹幕 preclaim 释放失败: %s", exc)
+
+
+async def _sync_pool_terminal(danmaku_id: str, reason: str) -> None:
+    """Best-effort in-memory projection of a DB terminal consumption."""
+    if reason == "ignored_after_read":
+        await danmaku_pool.mark_as_ignored_after_read(danmaku_id)
+    elif reason == "replied":
+        await danmaku_pool.mark_as_replied(danmaku_id, "")
+
+
+def _requires_live_presence_boundary(message: str) -> bool:
+    """Reuse the moderation hard-term guard before an active decision.
+
+    The full moderation analyzer remains asynchronous and unchanged.  This small
+    deterministic projection only protects known hard boundary terms from being
+    selected for ``IGNORE_AFTER_READ`` before that analyzer finishes.
+    """
+    text = str(message or "").casefold()
+    return any(
+        term.strip().casefold() in text
+        for term in settings.moderation.hard_violation_terms
+        if str(term).strip()
+    )
+
+
+def _live_presence_response_gate_bucket(
+    *, stream_session_id: str | None, danmaku_id: str
+) -> int:
+    """Return a stable, non-persisted bucket without exposing the source id."""
+    payload = (
+        f"live-presence-response-gate:{stream_session_id or 'no-session'}:"
+        f"{str(danmaku_id or '').strip()}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).digest()[0]
+
+
+async def _restore_pending_read_danmaku() -> int:
+    """Restore READ-without-terminal rows after a process restart.
+
+    The restore is bounded to the normal danmaku time window and feeds the
+    existing selector pool; it does not create a second reply queue or emit a
+    public event.  Legacy replied rows are excluded by the database query.
+    """
+    try:
+        window_minutes = max(1, int(settings.danmaku.time_window_minutes))
+        since_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        ).isoformat()
+        rows = await asyncio.to_thread(
+            db_manager.list_pending_read_danmaku,
+            limit=settings.danmaku.max_unread_pool_size,
+            since_at=since_at,
+        )
+    except Exception as exc:
+        logger.warning("恢复 read_pending 弹幕失败: %s", exc)
+        return 0
+
+    restored = 0
+    for row in rows:
+        try:
+            timestamp_text = str(row.get("timestamp") or "")
+            timestamp = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.astimezone().replace(tzinfo=None)
+            if await danmaku_pool.restore_read_danmaku(
+                danmaku_id=str(row["danmaku_id"]),
+                nickname=str(row.get("nickname") or ""),
+                message=str(row.get("message") or ""),
+                timestamp=timestamp,
+                read_at=str(row["read_at"]),
+            ):
+                restored += 1
+        except Exception as exc:
+            logger.debug("跳过无效 read_pending 弹幕恢复行: %s", exc)
+    if restored:
+        logger.info("已恢复 %d 条 read_pending 弹幕", restored)
+    return restored
 
 
 def _rate_limit_response(scope: str, retry_after_seconds: int) -> JSONResponse:
@@ -724,6 +843,7 @@ async def update_account_nickname(payload: NicknameUpdateRequest, request: Reque
     connection_manager.update_account_nickname(
         principal.account_id, account["nickname"], account["nickname_version"]
     )
+    stream_metadata_pusher.notify_audience_presence()
     return account
 
 
@@ -1282,6 +1402,18 @@ async def get_viewer_impression_stats():
     return await asyncio.to_thread(viewer_impression_service.get_stats)
 
 
+@router.get("/admin/live-presence", dependencies=ADMIN_ONLY)
+async def get_live_presence_diagnostics():
+    """P32-A/P32-B Live Presence 诊断；只返回动作/版本等低基数信息。"""
+    try:
+        return await asyncio.to_thread(stream_metadata_pusher.get_live_presence_snapshot)
+    except Exception as exc:
+        # 诊断旁路失败不应让管理端请求泄漏内部异常；与其它 Admin
+        # snapshot 保持一致，返回可识别的 503。
+        logger.exception("读取 Live Presence Shadow 诊断失败")
+        raise HTTPException(status_code=503, detail="Live Presence 诊断暂不可用") from exc
+
+
 # ==================== Token 审计与管理后台（P29） ====================
 
 
@@ -1419,6 +1551,9 @@ async def lifespan(app: FastAPI):
     )
     
     config_manager.update_settings(settings)
+    # message_history 是进程内展示缓存；启动时从持久化记录恢复，避免部署/重启
+    # 后新连接看到空列表。这里只恢复展示历史，不向普通弹幕 AI 选择器灌入旧消息。
+    await connection_manager.restore_message_history(db_manager)
     await plugin_manager.load_plugins()
     await persona_event_pipeline.start()
     await persona_event_pipeline.publish(
@@ -1426,6 +1561,7 @@ async def lifespan(app: FastAPI):
     )
     await mood_pusher.start()  # 启动心情推送服务
     await stream_metadata_pusher.start()  # 启动直播间元信息推送服务
+    await _restore_pending_read_danmaku()
     await sc_consumer.start()
     await stream_session_summary_consumer.start()
     await episodic_memory_consumer.start()
@@ -1478,6 +1614,16 @@ async def get_status():
         "mood_pusher": mood_pusher.get_stats(),
         "server_time": datetime.now().isoformat()
     }
+
+
+@router.get("/public/stats", response_model=PublicStatsResponse)
+async def get_public_stats():
+    """匿名读取公开直播统计；失败只影响该旁路接口。"""
+    try:
+        return await asyncio.to_thread(public_stats_service.get)
+    except Exception as exc:
+        logger.exception("公开统计读取失败")
+        raise HTTPException(status_code=503, detail="公开统计暂不可用") from exc
 
 
 @router.get("/config", response_model=ConfigResponse, dependencies=ADMIN_ONLY)
@@ -1888,6 +2034,7 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
     # 订阅各种推送服务
     await mood_pusher.subscribe(websocket)
     await stream_metadata_pusher.subscribe(websocket)
+    stream_metadata_pusher.notify_audience_presence()
     
     connected_at = time.monotonic()
     try:
@@ -2012,7 +2159,20 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                 
                 # 更新弹幕频率
                 current_rate = _update_danmaku_rate()
-                
+                # 重启后内存池为空，但 SQLite 仍保留终态。不要为同一外部
+                # danmakuID 再插入一条“未读”副本，否则旧的 IGNORE/REPLY
+                # 会被重新选中。
+                persisted_consumption = None
+                try:
+                    persisted_consumption = await asyncio.to_thread(
+                        db_manager.get_danmaku_consumption, message_data["danmakuID"]
+                    )
+                except Exception as consumption_lookup_error:
+                    logger.debug(
+                        "读取弹幕消费状态失败，继续兼容记录路径: %s",
+                        consumption_lookup_error,
+                    )
+
                 # 添加到弹幕池
                 await danmaku_pool.add_danmaku(
                     danmaku_id=message_data["danmakuID"],
@@ -2026,15 +2186,28 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                 # 那条会 finish；其余被有界表淘汰并计入 abandoned（顺带就是读取率）。
                 timing_trace_recorder.mark(message_data["danmakuID"], "pool_ready_at")
                 
-                # 记录弹幕到数据库
-                await asyncio.to_thread(
-                    db_manager.record_danmaku,
-                    danmaku_id=message_data["danmakuID"],
-                    nickname=message_data["nickname"],
-                    message=message_data["message"],
-                    client_ip=client_ip,
-                    sender_level=message_data.get("sender_level", 1)
-                )
+                # 记录弹幕到数据库；已有 external id 的行只复用生命周期，
+                # 避免把一个已消费的消息重新写成 UNREAD。
+                if persisted_consumption is None:
+                    await asyncio.to_thread(
+                        db_manager.record_danmaku,
+                        danmaku_id=message_data["danmakuID"],
+                        nickname=message_data["nickname"],
+                        message=message_data["message"],
+                        client_ip=client_ip,
+                        sender_level=message_data.get("sender_level", 1)
+                    )
+                elif persisted_consumption.get("status") == "read":
+                    await danmaku_pool.mark_as_read(message_data["danmakuID"])
+                elif persisted_consumption.get("status") == "consumed":
+                    reason = persisted_consumption.get("consumption_reason")
+                    if reason == "ignored_after_read":
+                        await danmaku_pool.mark_as_read(message_data["danmakuID"])
+                        await danmaku_pool.mark_as_ignored_after_read(
+                            message_data["danmakuID"]
+                        )
+                    elif reason == "replied":
+                        await danmaku_pool.mark_as_replied(message_data["danmakuID"], "")
                 
                 # 添加到弹幕记忆
                 memory_item = await danmaku_memory_manager.add_danmaku(
@@ -2207,6 +2380,183 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                             
                             logger.info(f"弹幕选择: [{selected.nickname}] {selected.message[:30]}... (置信度: {selection_result.confidence_score:.3f})")
                             
+                            session_id = stream_metadata_pusher.get_current_stream_session_id()
+
+                            # Attention SELECTED 只表示「主播决定读到这一条」。
+                            # P32-B 要求先提交 READ，再决定是回答还是已读后让行；
+                            # 这个顺序不能由回复文本反向创造。
+                            await danmaku_pool.mark_as_read(selected.id)
+                            read_persisted = False
+                            read_projection = None
+                            try:
+                                read_projection = await asyncio.to_thread(
+                                    db_manager.mark_danmaku_read, selected.id
+                                )
+                                read_persisted = read_projection.get("status") in {
+                                    "committed", "already_read"
+                                }
+                                if read_projection.get("status") == "committed":
+                                    stream_metadata_pusher.record_live_presence_read()
+                                    stream_metadata_pusher.preempt_speech_thread()
+                                if read_projection.get("status") == "already_consumed":
+                                    await _sync_pool_terminal(
+                                        selected.id,
+                                        read_projection.get("consumption_reason") or "replied",
+                                    )
+                                    timing_trace_recorder.finish(
+                                        trace_id, outcome="already_consumed"
+                                    )
+                                    continue
+                            except Exception as read_error:
+                                logger.warning(
+                                    "弹幕 READ 持久化失败，回退 Legacy ANSWER: %s",
+                                    read_error,
+                                )
+
+                            # Legacy 已经决定接这条弹幕后，旁路记录一次粗粒度
+                            # Live Presence Shadow 对照。这里不传正文、昵称或
+                            # danmaku id，也不等待 Shadow/SQLite 完成。
+                            stream_metadata_pusher.schedule_live_presence_observation(
+                                "ANSWER_DANMAKU", has_selected_danmaku=True,
+                            )
+
+                            # 同一条弹幕的 READ/IGNORE 与 ANSWER 也共用既有
+                            # processing claim。这样跨进程的两个池即使同时
+                            # 做出不同候选，只有 claim 持有者能继续到终态。
+                            processing_claim_token = uuid.uuid4().hex if session_id else None
+                            claim_acquired = True
+                            engine_session_id = session_id
+                            if session_id:
+                                try:
+                                    claim_acquired = bool(await asyncio.to_thread(
+                                        db_manager.claim_danmaku_processing,
+                                        stream_session_id=session_id,
+                                        source_type="normal",
+                                        danmaku_id=selected.id,
+                                        claim_token=processing_claim_token,
+                                        lease_seconds=settings.rate_limit.ai_reply_claim_lease_seconds,
+                                    ))
+                                except Exception as claim_error:
+                                    # 数据库短暂不可用时仍让 Legacy 回复链尝试
+                                    # 工作；把 session 标记清空会让 PersonaEngine
+                                    # 跳过 claim，避免把一次 DB 故障升级成用户侧
+                                    # 回复失败。成功后仍会尽力记录 reply。
+                                    logger.warning(
+                                        "普通弹幕 preclaim 失败，降级无 claim 回复: %s",
+                                        claim_error,
+                                    )
+                                    processing_claim_token = None
+                                    engine_session_id = None
+                            if not claim_acquired:
+                                timing_trace_recorder.finish(trace_id, outcome="duplicate")
+                                continue
+
+                            # READ 持久化成功后，才允许 P32-B active policy 选择
+                            # IGNORE_AFTER_READ。所有异常都回到正常回答路径。
+                            active_decision = None
+                            if read_persisted:
+                                is_verified_follow_up = False
+                                try:
+                                    identity_subject = (
+                                        selected.viewer_identity.subject_id
+                                        if selected.viewer_identity else None
+                                    )
+                                    if session_id:
+                                        is_verified_follow_up = bool(
+                                            prompt_ram_service.awaiting_current_viewer(
+                                                subject_id=identity_subject,
+                                                stream_session_id=session_id,
+                                            )
+                                        )
+                                except Exception:
+                                    is_verified_follow_up = False
+                                try:
+                                    recent_reply_signal = (
+                                        await danmaku_pool.get_recent_reply_signal()
+                                    )
+                                    active_decision = (
+                                        await stream_metadata_pusher.decide_live_presence_active(
+                                            has_selected_danmaku=True,
+                                            sc_pending=None,
+                                            danmaku_rate_60s=current_rate,
+                                            recent_reply_count=recent_reply_signal["count"],
+                                            seconds_since_last_reply=recent_reply_signal[
+                                                "seconds_since_last_reply"
+                                            ],
+                                            is_sc_danmaku=False,
+                                            is_verified_follow_up=is_verified_follow_up,
+                                            requires_boundary=_requires_live_presence_boundary(
+                                                selected.message
+                                            ),
+                                            response_gate_bucket=(
+                                                _live_presence_response_gate_bucket(
+                                                    stream_session_id=session_id,
+                                                    danmaku_id=selected.id,
+                                                )
+                                            ),
+                                        )
+                                    )
+                                except Exception as active_error:
+                                    logger.warning(
+                                        "Live Presence active decision 失败，回退 Legacy ANSWER: %s",
+                                        active_error,
+                                    )
+                                    active_decision = None
+
+                            if (
+                                active_decision is not None
+                                and active_decision.action.value == "IGNORE_AFTER_READ"
+                            ):
+                                try:
+                                    consume_result = await asyncio.to_thread(
+                                        db_manager.consume_danmaku,
+                                        selected.id,
+                                        reason="ignored_after_read",
+                                    )
+                                except Exception as consume_error:
+                                    logger.warning(
+                                        "IGNORE_AFTER_READ 终态写入失败，回退 Legacy ANSWER: %s",
+                                        consume_error,
+                                    )
+                                    stream_metadata_pusher.record_live_presence_consumption_write_error()
+                                    consume_result = {"status": "write_error"}
+                                if consume_result.get("status") in {
+                                    "committed", "already_consumed"
+                                }:
+                                    reason = consume_result.get("consumption_reason")
+                                    if reason == "ignored_after_read":
+                                        await danmaku_pool.mark_as_ignored_after_read(selected.id)
+                                        await _complete_processing_claim_if_needed(
+                                            stream_session_id=session_id,
+                                            danmaku_id=selected.id,
+                                            claim_token=processing_claim_token,
+                                        )
+                                        timing_trace_recorder.finish(
+                                            trace_id, outcome="ignored_after_read"
+                                        )
+                                        continue
+                                    if consume_result.get("status") == "already_consumed":
+                                        await _complete_processing_claim_if_needed(
+                                            stream_session_id=session_id,
+                                            danmaku_id=selected.id,
+                                            claim_token=processing_claim_token,
+                                        )
+                                        timing_trace_recorder.finish(
+                                            trace_id, outcome="already_consumed"
+                                        )
+                                        continue
+                                    if reason == "replied":
+                                        await _sync_pool_terminal(selected.id, reason)
+                                        await _complete_processing_claim_if_needed(
+                                            stream_session_id=session_id,
+                                            danmaku_id=selected.id,
+                                            claim_token=processing_claim_token,
+                                        )
+                                        timing_trace_recorder.finish(
+                                            trace_id, outcome="already_consumed"
+                                        )
+                                        continue
+
                             # 生成AI回复
                             logger.info(f"正在为弹幕生成回复: [{selected.nickname}] {selected.message}")
                             reply_lease = await ai_reply_work_gate.acquire(
@@ -2215,6 +2565,11 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                 wait_timeout=settings.rate_limit.ai_reply_queue_wait_seconds,
                             )
                             if reply_lease is None:
+                                await _release_processing_claim_if_needed(
+                                    stream_session_id=session_id,
+                                    danmaku_id=selected.id,
+                                    claim_token=processing_claim_token,
+                                )
                                 await danmaku_pool.release_selection(selected.id)
                                 timing_trace_recorder.finish(trace_id, outcome="degraded")
                                 await _send_ws_limit_event(
@@ -2228,6 +2583,11 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                             reply_quota = _check_ai_reply_quota(selected)
                             if not reply_quota.allowed:
                                 await reply_lease.release()
+                                await _release_processing_claim_if_needed(
+                                    stream_session_id=session_id,
+                                    danmaku_id=selected.id,
+                                    claim_token=processing_claim_token,
+                                )
                                 await danmaku_pool.release_selection(selected.id)
                                 timing_trace_recorder.finish(trace_id, outcome="degraded")
                                 await _send_ws_limit_event(
@@ -2236,6 +2596,8 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                     message="主播回复额度繁忙，请稍后继续互动",
                                 )
                                 continue
+                            thread_handle = await stream_metadata_pusher.begin_speech_thread_reply(selected.id)
+                            thread_reply_visible = False
                             try:
                                 try:
                                     reply_result = await persona_engine.generate_reply({
@@ -2243,7 +2605,9 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                         "message": selected.message,
                                         "danmakuID": selected.id,
                                         "_viewer_identity": selected.viewer_identity,
-                                        "_stream_session_id": stream_metadata_pusher.get_current_stream_session_id(),
+                                        "_stream_session_id": engine_session_id,
+                                        "_processing_claim_token": processing_claim_token,
+                                        "_processing_claim_preclaimed": True,
                                     })
                                 finally:
                                     await reply_lease.release()
@@ -2255,6 +2619,23 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                     # 标记为已回复，并存储回复内容
                                     reply_content = json.dumps(reply_data, ensure_ascii=False)
                                     await danmaku_pool.mark_as_replied(selected.id, reply_content)
+                                    reply_terminal_committed = False
+                                    try:
+                                        consume_result = await asyncio.to_thread(
+                                            db_manager.consume_danmaku,
+                                            selected.id,
+                                            reason="replied",
+                                        )
+                                        reply_terminal_committed = bool(
+                                            consume_result.get("status") in {
+                                                "committed", "already_consumed"
+                                            }
+                                            and consume_result.get("consumption_reason") == "replied"
+                                        )
+                                    except Exception as consume_error:
+                                        # Reply/Persona 已经成功；终态审计失败不能
+                                        # 让已经生成的公开回复消失。
+                                        logger.warning("回复终态写入失败: %s", consume_error)
                                     
                                     # 记录回复日志
                                     logger.info(f"AI回复生成成功: {reply_content}")
@@ -2315,7 +2696,11 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                     # 广播给所有连接的客户端
                                     broadcast_started_at = time.perf_counter()
                                     try:
-                                        await connection_manager.broadcast_json(reply_broadcast)
+                                        if thread_handle:
+                                            sent = await connection_manager.broadcast_json(reply_broadcast, delivery_report=True)
+                                            thread_reply_visible = bool(sent)
+                                        else:
+                                            await connection_manager.broadcast_json(reply_broadcast)
                                     finally:
                                         reply_timing_metrics.record(
                                             "broadcast",
@@ -2323,17 +2708,32 @@ async def websocket_endpoint(websocket: WebSocket, access_token: str = None):
                                             path="normal",
                                         )
                                     logger.info("AI回复已广播给所有客户端")
+                                    if reply_terminal_committed:
+                                        await danmaku_pool.record_successful_reply()
+                                        stream_metadata_pusher.schedule_live_presence_public_speech(
+                                            "ANSWER_DANMAKU", "DANMAKU_AVAILABLE"
+                                        )
                                     timing_trace_recorder.mark(trace_id, "broadcast_at")
                                     timing_trace_recorder.finish(trace_id, outcome="success")
                                 else:
                                     logger.warning("AI回复生成失败，结果为空")
                                     # 即使回复生成失败，也标记为已回复，并存储空回复内容
                                     await danmaku_pool.mark_as_replied(selected.id, "")
+                                    try:
+                                        await asyncio.to_thread(
+                                            db_manager.consume_danmaku,
+                                            selected.id,
+                                            reason="replied",
+                                        )
+                                    except Exception as consume_error:
+                                        logger.warning("空回复终态写入失败: %s", consume_error)
                                     timing_trace_recorder.finish(trace_id, outcome="error")
                                     
                             except Exception as e:
                                 logger.error(f"生成AI回复时出错: {e}")
                                 timing_trace_recorder.finish(trace_id, outcome="error")
+                            finally:
+                                await stream_metadata_pusher.finish_speech_thread_reply(thread_handle, thread_reply_visible)
                 
             except json.JSONDecodeError:
                 error_response = {

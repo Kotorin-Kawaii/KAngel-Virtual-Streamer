@@ -63,6 +63,31 @@ class ViewerImpressionGenerateResponse(BaseModel):
     existing_task: bool = False
 
 
+class PublicStatsToday(BaseModel):
+    """当前配置时区自然日内的匿名计数。"""
+
+    replies: int = Field(ge=0)
+    danmaku: int = Field(ge=0)
+    new_accounts: int = Field(ge=0)
+
+
+class PublicStatsAllTime(BaseModel):
+    """公开服务启动以来的匿名累计计数。"""
+
+    replies: int = Field(ge=0)
+    danmaku: int = Field(ge=0)
+    registered_accounts: int = Field(ge=0)
+
+
+class PublicStatsResponse(BaseModel):
+    """公开统计契约；不包含用户、昵称、原始消息或其他身份字段。"""
+
+    generated_at: str
+    timezone: str
+    today: PublicStatsToday
+    all_time: PublicStatsAllTime
+
+
 _SC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
 
 

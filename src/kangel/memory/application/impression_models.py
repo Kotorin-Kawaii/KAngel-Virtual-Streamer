@@ -155,8 +155,23 @@ class CriticResult(StageModel):
 def parse_stage_json(raw: str) -> dict[str, Any]:
     # Do not echo validation exceptions into ordinary logs: pydantic includes
     # the offending input, which can be private evidence or a draft.
-    if len(raw) > 500000:
+    text = str(raw or "").lstrip("\ufeff").strip()
+    if len(text) > 500000:
         raise ValueError("stage_output_too_large")
+    # Providers occasionally wrap an otherwise valid JSON object in a fenced
+    # Markdown block despite the prompt asking for JSON-only output.  Accept
+    # only a complete fence; do not attempt to extract arbitrary JSON from
+    # surrounding prose, which could hide an instruction or an unvalidated
+    # second object.  The strict stage models below remain authoritative.
+    if text.startswith("```"):
+        fenced = re.fullmatch(
+            r"```(?:json)?[ \t]*\r?\n?(.*?)\r?\n?```",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not fenced:
+            raise ValueError("stage_output_not_json")
+        text = fenced.group(1).strip()
     def unique_object(pairs):
         result = {}
         for key, value in pairs:
@@ -168,7 +183,7 @@ def parse_stage_json(raw: str) -> dict[str, Any]:
     def reject_constant(_value):
         raise ValueError("non_finite_stage_number")
 
-    value = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    value = json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
     if not isinstance(value, dict):
         raise ValueError("stage_output_not_object")
     return value

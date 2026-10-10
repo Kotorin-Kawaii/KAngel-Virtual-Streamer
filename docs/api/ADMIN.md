@@ -303,7 +303,7 @@ TTL 是否合适、消毒有没有误杀，都看 `stats` 与 `note`）。
                "on_invalid_output": "defer",
                "note": "DEFER 不 claim、不标记已回复、不删除候选，也不计入 ignore_rate"}
   },
-  "ai_routes": { "…": "runtime_diagnostics()：每个角色实际走了哪个供应商与模型" }
+  "ai_routes": { "…": "runtime_diagnostics()：每个角色实际走哪个供应商、模型、协议及 proxy_enabled" }
 }
 ```
 

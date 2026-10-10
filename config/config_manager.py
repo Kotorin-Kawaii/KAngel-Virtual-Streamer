@@ -19,7 +19,9 @@ class ConfigManager:
 
     # 导出时替换凭据的固定哨兵；回灌时会跳过恰好等于它的值。
     REDACTED = "***"
-    SECRET_KEY_MARKERS = ("api_key", "apikey", "token", "secret", "password")
+    SECRET_KEY_MARKERS = (
+        "api_key", "apikey", "token", "secret", "password", "proxy_url",
+    )
 
     def __init__(self, config_file: Optional[str] = None):
         self._config_file = config_file or "config.json"
@@ -144,10 +146,15 @@ class ConfigManager:
             providers = ai.get("providers")
             if isinstance(providers, list):
                 for provider in providers:
-                    if isinstance(provider, dict) and cls._has_value(
-                        provider.get("api_key")
-                    ):
-                        provider["api_key"] = cls.REDACTED
+                    if isinstance(provider, dict):
+                        if cls._has_value(provider.get("api_key")):
+                            provider["api_key"] = cls.REDACTED
+                        # Proxy URLs may contain embedded credentials.  Never
+                        # expose them through the admin config projection.
+                        if cls._has_value(provider.get("proxy_url")):
+                            provider["proxy_url"] = cls.REDACTED
+            if cls._has_value(ai.get("proxy_url")):
+                ai["proxy_url"] = cls.REDACTED
         if isinstance(payload.get("admin"), dict) and cls._has_value(
             payload["admin"].get("api_key")
         ):

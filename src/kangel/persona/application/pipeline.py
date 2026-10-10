@@ -36,6 +36,15 @@ class PersonaEventLog(Protocol):
     def append(self, record: dict) -> None: ...
 
 
+# 定时器事件会继续驱动 reducer、观察者和内存调试历史，但不把每次 tick 的
+# 完整 before/after JSON 追加到持久化回放日志。显式业务事件即使复用了这些
+# event type，也只有 source=timer 时才走该低成本路径。
+_NON_DURABLE_TIMER_EVENT_TYPES = frozenset({
+    PersonaEventType.SILENCE_TICK,
+    PersonaEventType.AUDIENCE_ATMOSPHERE_TICK,
+})
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         # 兼容旧调用者传入的本地 naive 时间；新事件一律生成 aware UTC。
@@ -226,7 +235,7 @@ class PersonaEventPipeline:
             "internal": after_internal.model_dump(),
         })
         self._history.append(snapshot)
-        if self.event_log:
+        if self.event_log and not self._is_non_durable_timer_event(event):
             try:
                 self.event_log.append(snapshot)
             except Exception as exc:
@@ -240,6 +249,14 @@ class PersonaEventPipeline:
             except Exception as exc:
                 logger.debug("人格事件只读观察者失败: %s", exc)
         return mutation
+
+    @staticmethod
+    def _is_non_durable_timer_event(event: PersonaEvent) -> bool:
+        """判断是否为仅保留在内存中的周期性人格 tick。"""
+        return (
+            getattr(event, "source", None) == "timer"
+            and getattr(event, "event_type", None) in _NON_DURABLE_TIMER_EVENT_TYPES
+        )
 
     def _remember_event(self, event_id: str) -> None:
         if len(self._processed_order) == self._processed_order.maxlen:

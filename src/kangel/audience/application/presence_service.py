@@ -73,5 +73,9 @@ class ViewerPresenceCoordinator:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def presence_id(self, subject_id: str) -> str | None:
+        """Event-loop-only read: reconnects retain their ephemeral visit identity."""
+        return self._presence_ids.get(subject_id)
+
 
 viewer_presence_coordinator = ViewerPresenceCoordinator()

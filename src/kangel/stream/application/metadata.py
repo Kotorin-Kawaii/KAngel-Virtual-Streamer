@@ -23,6 +23,8 @@ from .beat import StreamerBeatScheduler
 from .idle_state import IdleState, IdleStateResolver
 from .mainline import DailyStreamPlanService, StreamMainlineService
 from ..domain.mainline import StreamMainlineState
+from ..domain.semantic_context import StreamSemanticContext, unified_stream_semantics_enabled
+from ..domain.live_presence import LiveActDecision, LiveActType, LivePresenceContext
 from .director import (
     ActionExecutionResult,
     DirectorPerformanceTemplates,
@@ -31,6 +33,7 @@ from .director import (
     StreamerActionDecision,
     StreamerActionExecutor,
 )
+from .live_presence import LivePresenceService, live_presence_service
 
 
 class MetadataEventType(Enum):
@@ -128,6 +131,7 @@ class StreamMetadataPusher:
         beat_scheduler: Optional[StreamerBeatScheduler] = None,
         mainline_service: Optional[StreamMainlineService] = None,
         director_runtime: Optional[StreamDirectorRuntime] = None,
+        live_presence: Optional[LivePresenceService] = None,
     ):
         self._subscribers: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
@@ -157,6 +161,13 @@ class StreamMetadataPusher:
         self._current_mainline: Optional[StreamMainlineState] = None
         self._director_runtime = director_runtime
         self._director_templates = DirectorPerformanceTemplates()
+        self._live_presence_service = live_presence
+        self._live_presence_eval_task: Optional[asyncio.Task] = None
+        # Shadow is deliberately a bounded, best-effort side channel.  A busy
+        # stream must never accumulate one SQLite task per legacy action.
+        self._live_presence_tasks: Set[asyncio.Task] = set()
+        self._live_presence_task_capacity = 32
+        self._last_live_presence_eval_at = 0.0
         self._last_activity_proposal: Optional[dict] = None
         self._intent_service = None
         self._session_summary_service = None
@@ -200,6 +211,7 @@ class StreamMetadataPusher:
         
         # 扩展处理器（用于后期添加新的元信息处理逻辑）
         self._extension_handlers: Dict[str, Callable] = {}
+        self._speech_thread_runtime = None
     
     async def start(self):
         """启动推送服务"""
@@ -228,7 +240,28 @@ class StreamMetadataPusher:
         self._ensure_mainline_service()
         
         self._running = True
+        self._last_live_presence_eval_at = 0.0
         self._refresh_schedule()
+        if (
+            settings.stream.live_presence_enabled
+            and self._metadata.is_live
+            and self._metadata.stream_session_id
+        ):
+            try:
+                await asyncio.to_thread(
+                    self._ensure_live_presence_service().get_or_create,
+                    stream_session_id=self._metadata.stream_session_id,
+                    mainline_beat_version=(
+                        self._current_mainline.beat_version
+                        if self._current_mainline else None
+                    ),
+                    activity_version=(
+                        self._current_activity.version
+                        if self._current_activity else None
+                    ),
+                )
+            except Exception as exc:
+                logger.debug("Live Presence 初始状态创建已忽略: %s", exc)
         if settings.stream.director_enabled:
             runtime = self._ensure_director_runtime()
             from kangel.infrastructure.event_bus import persona_event_pipeline
@@ -236,6 +269,12 @@ class StreamMetadataPusher:
             await runtime.start()
         self._stats["start_time"] = datetime.now().isoformat()
         self._push_task = asyncio.create_task(self._push_loop())
+        if settings.stream.live_presence_enabled and (
+            settings.stream.live_presence_thread_enabled or settings.stream.audience_presence_enabled
+        ):
+            from kangel.stream.application.speech_thread_runtime import SpeechThreadRuntime
+            self._speech_thread_runtime = SpeechThreadRuntime(self)
+            await self._speech_thread_runtime.start()
         
         logger.info(f"直播间元信息推送服务启动，推送间隔: {self._push_interval_ms}ms")
     
@@ -245,6 +284,8 @@ class StreamMetadataPusher:
             return
         
         self._running = False
+        if self._speech_thread_runtime:
+            await self._speech_thread_runtime.stop()
         
         if self._push_task:
             self._push_task.cancel()
@@ -258,6 +299,20 @@ class StreamMetadataPusher:
                 self._director_runtime.observe_persona_event
             )
             await self._director_runtime.stop()
+        if self._live_presence_eval_task:
+            self._live_presence_eval_task.cancel()
+            try:
+                await self._live_presence_eval_task
+            except asyncio.CancelledError:
+                pass
+            self._live_presence_eval_task = None
+        pending_presence_tasks = list(self._live_presence_tasks)
+        for task in pending_presence_tasks:
+            if not task.done():
+                task.cancel()
+        if pending_presence_tasks:
+            await asyncio.gather(*pending_presence_tasks, return_exceptions=True)
+        self._live_presence_tasks.clear()
         
         logger.info("直播间元信息推送服务已停止")
     
@@ -376,6 +431,7 @@ class StreamMetadataPusher:
                 await asyncio.sleep(wait_seconds)
                 changed = self._refresh_schedule()
                 await self._maybe_emit_streamer_beat()
+                await self._maybe_evaluate_live_presence()
                 
                 if self._subscribers:
                     await self._broadcast_metadata()
@@ -469,15 +525,19 @@ class StreamMetadataPusher:
         
         await self._broadcast_to_all(message)
     
-    async def _broadcast_to_all(self, message: dict):
+    async def _broadcast_to_all(self, message: dict, *, delivery_guard=None):
         """广播给所有订阅者"""
         disconnected = set()
+        delivered = 0
         message_str = json.dumps(message, ensure_ascii=False)
         
         async with self._lock:
             for websocket in self._subscribers:
+                if delivery_guard is not None and not delivery_guard():
+                    break
                 try:
                     await websocket.send_text(message_str)
+                    delivered += 1
                 except Exception as e:
                     logger.error(f"发送元信息失败: {e}")
                     disconnected.add(websocket)
@@ -485,6 +545,7 @@ class StreamMetadataPusher:
             # 移除断开的连接
             for ws in disconnected:
                 self._subscribers.discard(ws)
+        return delivered
     
     async def _send_metadata_to_client(self, websocket: WebSocket):
         """发送元信息给单个客户端"""
@@ -582,7 +643,40 @@ class StreamMetadataPusher:
                     )
                 except RuntimeError:
                     pass
+            if previous[0] and not current[0] and previous[1]:
+                self._schedule_live_presence_completion(previous[1])
+            if not previous[0] and current[0] and current[1]:
+                self._schedule_live_presence_initialization(
+                    current[1],
+                    mainline_beat_version=current[8],
+                    activity_version=current[7],
+                )
         return changed
+
+    def _schedule_live_presence_initialization(
+        self,
+        session_id: str,
+        *,
+        mainline_beat_version: int | None = None,
+        activity_version: int | None = None,
+    ) -> None:
+        if not self._running or not settings.stream.live_presence_enabled or not session_id:
+            return
+        self._track_live_presence_task(
+            asyncio.to_thread(
+                self._ensure_live_presence_service().get_or_create,
+                stream_session_id=session_id,
+                mainline_beat_version=mainline_beat_version,
+                activity_version=activity_version,
+            )
+        )
+
+    def _schedule_live_presence_completion(self, session_id: str) -> None:
+        if not self._running or not settings.stream.live_presence_enabled:
+            return
+        self._track_live_presence_task(
+            asyncio.to_thread(self._ensure_live_presence_service().complete, session_id)
+        )
 
     def _record_theme_metrics(self, theme) -> None:
         """主题指标只按自然日/配置状态变化累计，避免每次元数据刷新放大。"""
@@ -638,6 +732,393 @@ class StreamMetadataPusher:
                 ai_candidate=ai_candidate,
             )
         return self._director_runtime
+
+    def _ensure_live_presence_service(self) -> LivePresenceService:
+        if self._live_presence_service is None:
+            # 默认实例与其它进程级 Stream 服务共用 db_manager；测试可以在
+            # 构造器中注入独立实例，不会污染线上聚合指标。
+            self._live_presence_service = live_presence_service
+        return self._live_presence_service
+
+    def _build_live_presence_context(
+        self,
+        *,
+        has_selected_danmaku: bool = False,
+        sc_pending: bool | None = None,
+        danmaku_rate_60s: int | None = None,
+        recent_reply_count: int = 0,
+        seconds_since_last_reply: float | None = None,
+        is_sc_danmaku: bool = False,
+        is_verified_follow_up: bool = False,
+        requires_boundary: bool = False,
+        response_gate_bucket: int | None = None,
+        include_last_speech: bool = False,
+    ) -> Optional[LivePresenceContext]:
+        """构造 Live Presence 的聚合事实输入，不读取正文、昵称或关系记忆。"""
+        if (
+            not settings.stream.live_presence_enabled
+            or not self._metadata.is_live
+            or not self._metadata.stream_session_id
+        ):
+            return None
+        signals = (
+            self._director_runtime.signals.snapshot()
+            if self._director_runtime else None
+        )
+        rate_60s = int(
+            danmaku_rate_60s if danmaku_rate_60s is not None
+            else (signals.rate_60s if signals else 0)
+        )
+        silence_seconds = float(signals.silence_seconds if signals else 0.0)
+        ai_waiting = False
+        try:
+            from kangel.infrastructure.bounded_work_gate import ai_reply_work_gate
+            gate = ai_reply_work_gate.snapshot()
+            ai_waiting = bool(gate.get("active") or gate.get("waiting"))
+        except Exception:
+            # 观察层不得因诊断信号读取失败阻塞生产链。
+            ai_waiting = True
+        if sc_pending is None:
+            try:
+                from kangel.integrations.superchat.service import sc_service
+                sc_pending = bool(sc_service.has_active_work())
+            except Exception:
+                sc_pending = True
+        beat_version = (
+            self._current_mainline.beat_version
+            if self._current_mainline else None
+        )
+        activity_version = self._current_activity.version if self._current_activity else None
+        seconds_since_last_speech = None
+        if include_last_speech:
+            try:
+                seconds_since_last_speech = (
+                    self._ensure_live_presence_service().seconds_since_last_speech(
+                        self._metadata.stream_session_id
+                    )
+                )
+            except Exception:
+                # 无法证明舞台冷却已结束时保持安静。
+                seconds_since_last_speech = 0.0
+        return LivePresenceContext(
+            stream_session_id=self._metadata.stream_session_id,
+            is_live=self._metadata.is_live,
+            has_selected_danmaku=has_selected_danmaku,
+            has_active_thread=False,
+            has_suspended_thread=False,
+            seconds_since_last_speech=seconds_since_last_speech,
+            danmaku_rate_60s=rate_60s,
+            silence_seconds=silence_seconds,
+            mainline_beat_version=beat_version,
+            activity_version=activity_version,
+            ai_waiting=ai_waiting,
+            sc_pending=bool(sc_pending),
+            recent_reply_count=recent_reply_count,
+            seconds_since_last_reply=seconds_since_last_reply,
+            is_sc_danmaku=is_sc_danmaku,
+            is_verified_follow_up=is_verified_follow_up,
+            requires_boundary=requires_boundary,
+            response_gate_bucket=response_gate_bucket,
+        )
+
+    async def decide_live_presence_active(
+        self,
+        *,
+        has_selected_danmaku: bool = False,
+        sc_pending: bool | None = None,
+        danmaku_rate_60s: int | None = None,
+        recent_reply_count: int = 0,
+        seconds_since_last_reply: float | None = None,
+        is_sc_danmaku: bool = False,
+        is_verified_follow_up: bool = False,
+        requires_boundary: bool = False,
+        response_gate_bucket: int | None = None,
+    ) -> LiveActDecision | None:
+        """P32-B active policy bridge; facts only, no reply/Persona side effects."""
+        if not self._ensure_live_presence_service().active_enabled():
+            return None
+        context = self._build_live_presence_context(
+            has_selected_danmaku=has_selected_danmaku,
+            sc_pending=sc_pending,
+            danmaku_rate_60s=danmaku_rate_60s,
+            recent_reply_count=recent_reply_count,
+            seconds_since_last_reply=seconds_since_last_reply,
+            is_sc_danmaku=is_sc_danmaku,
+            is_verified_follow_up=is_verified_follow_up,
+            requires_boundary=requires_boundary,
+            response_gate_bucket=response_gate_bucket,
+        )
+        if context is None:
+            return None
+        return await self._ensure_live_presence_service().decide_active(context)
+
+    def record_live_presence_consumption_write_error(self) -> None:
+        """计数 P32-B 终态写入失败；不暴露弹幕或身份信息。"""
+        try:
+            self._ensure_live_presence_service().metrics.record_consumption_write_error()
+        except Exception:
+            logger.debug("Live Presence consumption error metric ignored", exc_info=True)
+
+    def record_live_presence_read(self) -> None:
+        """计数一次已选中弹幕的 READ 事实提交。"""
+        try:
+            self._ensure_live_presence_service().metrics.record_read()
+        except Exception:
+            logger.debug("Live Presence read metric ignored", exc_info=True)
+
+    def schedule_live_presence_public_speech(
+        self,
+        action: str,
+        reason_code: str,
+    ) -> bool:
+        """Persist a successful public utterance off the reply critical path."""
+        if (
+            not settings.stream.live_presence_enabled
+            or not self._metadata.is_live
+            or not self._metadata.stream_session_id
+        ):
+            return False
+        return self._track_live_presence_task(
+            self._record_live_presence_public_speech(action, reason_code)
+        )
+
+    async def _record_live_presence_public_speech(
+        self,
+        action: str,
+        reason_code: str | None,
+    ) -> None:
+        try:
+            act = LiveActType(str(action))
+        except ValueError:
+            return
+        await asyncio.to_thread(
+            self._ensure_live_presence_service().record_public_speech,
+            stream_session_id=self._metadata.stream_session_id,
+            action=act,
+            reason_code=reason_code,
+            mainline_beat_version=(
+                self._current_mainline.beat_version
+                if self._current_mainline else None
+            ),
+            activity_version=(
+                self._current_activity.version if self._current_activity else None
+            ),
+        )
+
+    def schedule_live_presence_observation(
+        self,
+        legacy_action: str,
+        *,
+        has_selected_danmaku: bool = False,
+        sc_pending: bool | None = None,
+    ) -> bool:
+        """安排一次 fail-silent Shadow 观察，不让调用方等待 SQLite。"""
+        if (
+            not self._running
+            or not settings.stream.live_presence_enabled
+            or not settings.stream.live_presence_shadow_enabled
+            or not self._metadata.is_live
+            or not self._metadata.stream_session_id
+        ):
+            return False
+        return self._track_live_presence_task(
+            self._observe_live_presence_action(
+                legacy_action,
+                has_selected_danmaku=has_selected_danmaku,
+                sc_pending=sc_pending,
+            )
+        )
+
+    def _track_live_presence_task(self, coroutine) -> bool:
+        """Track a bounded best-effort task and close it if no loop/capacity."""
+        if len(self._live_presence_tasks) >= self._live_presence_task_capacity:
+            coroutine.close()
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coroutine.close()
+            return False
+        task = loop.create_task(coroutine)
+        self._live_presence_tasks.add(task)
+        task.add_done_callback(self._live_presence_tasks.discard)
+        return True
+
+    async def _observe_live_presence_action(
+        self,
+        legacy_action: str,
+        *,
+        has_selected_danmaku: bool,
+        sc_pending: bool | None,
+    ) -> None:
+        # Build the signal snapshot inside the side task so the legacy caller
+        # only pays the cost of a bounded create_task operation.
+        context = self._build_live_presence_context(
+            has_selected_danmaku=has_selected_danmaku, sc_pending=sc_pending
+        )
+        if context is not None:
+            await self._run_live_presence_observation(context, legacy_action)
+
+    async def _run_live_presence_observation(
+        self, context: LivePresenceContext, legacy_action: str
+    ) -> None:
+        try:
+            await self._ensure_live_presence_service().observe_legacy_action(
+                context, legacy_action=legacy_action
+            )
+        except Exception as exc:
+            # Shadow 永远 fail-silent 对观众；服务自身已经计数，这里只防止
+            # 未预期异常成为 asyncio 未取回异常。
+            logger.debug("Live Presence Shadow 观察已忽略: %s", exc)
+
+    async def _maybe_evaluate_live_presence(self) -> None:
+        """复用既有 metadata worker 的低频入口，不创建第二套直播主循环。"""
+        service = self._ensure_live_presence_service()
+        shadow_enabled = bool(settings.stream.live_presence_shadow_enabled)
+        self_talk_enabled = bool(service.self_talk_active_enabled())
+        if (
+            not settings.stream.live_presence_enabled
+            or not (shadow_enabled or self_talk_enabled)
+            or not self._metadata.is_live
+        ):
+            return
+        interval = max(300.0, float(settings.stream.director_tick_seconds))
+        now = time.monotonic()
+        if now - self._last_live_presence_eval_at < interval:
+            return
+        if self._live_presence_eval_task and not self._live_presence_eval_task.done():
+            return
+        context = self._build_live_presence_context(include_last_speech=True)
+        if context is None:
+            return
+        self._last_live_presence_eval_at = now
+        if shadow_enabled:
+            self._live_presence_eval_task = asyncio.create_task(
+                self._run_live_presence_observation(context, "NO_ACTION")
+            )
+            self._live_presence_tasks.add(self._live_presence_eval_task)
+            self._live_presence_eval_task.add_done_callback(
+                self._live_presence_tasks.discard
+            )
+        if self_talk_enabled:
+            await self._maybe_execute_live_presence_self_talk()
+
+    async def _maybe_execute_live_presence_self_talk(self) -> bool:
+        """P32-C0: execute one fact-grounded quiet-room utterance, or stay silent."""
+        service = self._ensure_live_presence_service()
+        runtime = self._director_runtime
+        if (
+            not service.self_talk_active_enabled()
+            or runtime is None
+            or not settings.stream.director_enabled
+            or not settings.stream.director_performance_enabled
+        ):
+            return False
+        try:
+            if settings.stream.live_presence_thread_enabled:
+                state = await asyncio.to_thread(
+                    service.get, self._metadata.stream_session_id
+                )
+                if state and (
+                    state.active_thread or state.suspended_threads
+                    or state.pending_speech_attempt
+                ):
+                    return False
+            from kangel.danmaku.application.pool import danmaku_pool
+
+            if await danmaku_pool.has_pending_reply_work():
+                service.metrics.record_self_talk_suppressed()
+                return False
+            context = self._build_live_presence_context(include_last_speech=True)
+            if context is None:
+                return False
+            decision = await service.decide_active_self_talk(context)
+            if decision is None:
+                return False
+            activity = self._current_activity
+            mainline = self._current_mainline
+            if activity is None or mainline is None:
+                service.metrics.record_self_talk_suppressed()
+                return False
+            family = {
+                "game": "QUIET_GAME_COMMENTARY",
+                "chat": "QUIET_CHAT_COMMENTARY",
+            }.get(activity.category, "QUIET_STAGE_COMMENTARY")
+            performed = await runtime.perform_authorized_performance(
+                PerformanceAction(
+                    "SPEAK", template_family=family, emotion_hint="思考"
+                ),
+                stream_session_id=context.stream_session_id,
+                beat_version=mainline.beat_version,
+                activity_version=activity.version,
+            )
+            if not performed:
+                service.metrics.record_self_talk_suppressed()
+                return False
+            committed = await asyncio.to_thread(
+                service.commit_active_self_talk, context, decision
+            )
+            if committed is None:
+                logger.warning("P32-C0 SELF_TALK 已播出但舞台时间戳提交失败")
+            return True
+        except Exception as exc:
+            service.metrics.record_self_talk_suppressed()
+            logger.warning("P32-C0 SELF_TALK 执行失败，保持安静: %s", exc)
+            return False
+
+    def get_live_presence_snapshot(self) -> dict[str, Any]:
+        """供 Admin 诊断使用；不影响公开 metadata。"""
+        presence = self._ensure_live_presence_service()
+        snapshot = presence.snapshot()
+        snapshot["thread_enabled"] = settings.stream.live_presence_thread_enabled
+        snapshot["thread_resume_active_enabled"] = settings.stream.live_presence_thread_resume_active_enabled
+        snapshot["thread_opener_enabled"] = settings.stream.live_presence_thread_opener_enabled
+        snapshot["thread_suspend_active_enabled"] = settings.stream.live_presence_thread_suspend_active_enabled
+        snapshot["thread_semantic_hint_enabled"] = settings.stream.live_presence_thread_semantic_hint_enabled
+        if settings.stream.audience_presence_enabled:
+            runtime = self._speech_thread_runtime
+            snapshot["audience_presence"] = {
+                "enabled": True, "greeting_active_enabled": settings.stream.audience_greeting_active_enabled,
+                "worker_alive": bool(runtime and runtime.task and not runtime.task.done()),
+                **(runtime.audience.tracker.snapshot() if runtime else {}),
+            }
+            if runtime:
+                snapshot["audience_presence"]["recent_public_speeches"] = presence.stage_speech_journal.snapshot()
+        if settings.stream.live_presence_thread_enabled:
+            from kangel.stream.application.speech_thread import SpeechThreadService
+            snapshot["thread_continuity"] = SpeechThreadService(presence).diagnostics(presence._latest_state())
+            state = presence._latest_state()
+            facts = self._build_director_context()
+            thread = SpeechThreadService.current(state) if state else None
+            snapshot["thread_continuity"]["compatibility"] = (
+                SpeechThreadService.incompatibility(thread, facts) or "compatible"
+                if thread and facts else "unavailable"
+            )
+            snapshot["thread_continuity"]["recent_public_speeches"] = presence.stage_speech_journal.snapshot()
+        return snapshot
+
+    def preempt_speech_thread(self) -> None:
+        runtime = self._speech_thread_runtime
+        if runtime:
+            runtime.preempt()
+
+    def notify_audience_presence(self) -> None:
+        if settings.stream.audience_presence_enabled and self._speech_thread_runtime:
+            # Immediate roster invalidation makes disconnect/rename safe during a send.
+            try:
+                self._speech_thread_runtime.audience.refresh()
+                self._speech_thread_runtime.notify()
+            except Exception:
+                logger.debug("Audience presence wake ignored")
+
+    async def begin_speech_thread_reply(self, event_id: str, source: str = "normal"):
+        runtime = self._speech_thread_runtime
+        return await runtime.begin_reply(event_id, source) if runtime else None
+
+    async def finish_speech_thread_reply(self, handle, visible: bool) -> None:
+        runtime = self._speech_thread_runtime
+        if runtime:
+            await runtime.finish_reply(handle, visible)
 
     async def _maybe_emit_streamer_beat(self) -> None:
         """独立微动作仅使用运行快照；阻塞主链路时安静跳过。"""
@@ -949,10 +1430,8 @@ class StreamMetadataPusher:
             "name": state.theme_snapshot.get("name") or theme.daily_theme_name,
             "date": state.theme_date,
         }
-        # 旧字段在直播中也投影同一份冻结事实，避免跨午夜或配置热更新后
-        # daily_theme_* 与 session_theme 自相矛盾；这是对既有公开字段的
-        # 语义变更，因此按灰度开关控制，默认仍跟随实时配置。
-        if settings.stream.mainline_theme_projection_enabled:
+        # Active 舞台与回复使用同一份场次事实；退出 Active 后恢复旧灰度开关。
+        if settings.stream.mainline_theme_projection_enabled or unified_stream_semantics_enabled(settings.stream):
             self._metadata.daily_theme_id = state.theme_id
             self._metadata.daily_theme_name = (
                 state.theme_snapshot.get("name") or theme.daily_theme_name
@@ -1279,12 +1758,18 @@ class StreamMetadataPusher:
                 arousal=persona_engine.internal_state.arousal,
                 audience_sentiment=signals.audience_sentiment,
             )
+        audience_summary = None
+        if settings.stream.audience_presence_enabled:
+            from kangel.audience.application.stage_presence import audience_counts
+            from kangel.transport.websocket.connection_manager import connection_manager
+            audience_summary = audience_counts(tuple(connection_manager.active_connections.values()))
         return {
             "is_live": True,
             "now": now,
             "remaining_seconds": remaining,
             "mainline": self._current_mainline,
             "activity": self._current_activity,
+            "semantic_context": self._committed_stream_semantic_context(),
             "activity_candidate": activity_candidate,
             "eligible_activities": (
                 [dict(item) for item in self._activity_service.candidates]
@@ -1298,7 +1783,11 @@ class StreamMetadataPusher:
             "darkness": persona_engine.state.darkness,
             "fatigue": persona_engine.internal_state.fatigue,
             "arousal": persona_engine.internal_state.arousal,
-            "viewer_count": self._metadata.viewer_count,
+            "attachment": persona_engine.internal_state.attachment,
+            "confidence": persona_engine.internal_state.confidence,
+            "viewer_count": (audience_summary["online_subject_count"]
+                             if audience_summary is not None else self._metadata.viewer_count),
+            **({"audience_presence": audience_summary} if audience_summary is not None else {}),
             "busy": busy,
         }
 
@@ -1352,6 +1841,21 @@ class StreamMetadataPusher:
     async def _on_director_performance(
         self, action: PerformanceAction, context: dict[str, Any]
     ) -> bool:
+        if (settings.stream.live_presence_thread_enabled or settings.stream.audience_presence_enabled) and action.type == "SPEAK":
+            runtime = self._speech_thread_runtime
+            if runtime and runtime.work and not runtime.work.done():
+                return False
+            if runtime and runtime.generation and not runtime.generation.done():
+                return False
+            if settings.stream.live_presence_thread_enabled:
+                state = await asyncio.to_thread(self._ensure_live_presence_service().get, self._metadata.stream_session_id)
+                if state and (state.active_thread or state.suspended_threads or state.pending_speech_attempt):
+                    return False
+        if context.get("live_presence_self_talk_authorized"):
+            from kangel.danmaku.application.pool import danmaku_pool
+
+            if await danmaku_pool.has_pending_reply_work():
+                return False
         # Performance 是可丢弃出口，提交后仍要重新检查关键回复是否开始。
         latest = self._build_director_context()
         if not latest or latest.get("busy"):
@@ -1368,7 +1872,8 @@ class StreamMetadataPusher:
             if not reply:
                 return False
             if (
-                settings.stream.director_ai_speak_polish_enabled
+                not context.get("live_presence_self_talk_authorized")
+                and settings.stream.director_ai_speak_polish_enabled
                 and self._director_runtime
                 and self._director_runtime.ai_candidate is not None
             ):
@@ -1386,8 +1891,13 @@ class StreamMetadataPusher:
                 ):
                     return False
                 if polished:
-                    sentence["text"] = polished
-            await self._broadcast_to_all({
+                    from kangel.persona.application.stage_speech import validate_stage_result
+                    proposed = {"emotions": reply["emotions"],
+                                "sentences": [{**sentence, "text": polished}]}
+                    if (validate_stage_result(json.dumps(proposed, ensure_ascii=False)) is not None
+                        and self.reply_preserves_activity_fact(proposed)):
+                        sentence["text"] = polished
+            sent = await self._broadcast_to_all({
                 "type": WebSocketEventType.AI_REPLY,
                 "data": {
                     "source": "stream_director",
@@ -1398,6 +1908,22 @@ class StreamMetadataPusher:
                 },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
+            if not sent:
+                return False
+            if settings.stream.live_presence_enabled:
+                try:
+                    from uuid import uuid4
+                    self._ensure_live_presence_service().stage_speech_journal.record(
+                        speech_id=str(uuid4()), stream_session_id=mainline.stream_session_id,
+                        operation="director_speak", reply=reply, delivered_count=sent,
+                        beat_version=mainline.beat_version, activity_version=latest["activity"].version)
+                except Exception:
+                    self._ensure_live_presence_service().metrics.increment("thread_review_errors")
+            if not context.get("live_presence_self_talk_authorized"):
+                await self._record_live_presence_public_speech(
+                    "SELF_TALK", None
+                )
+            self.schedule_live_presence_observation("SELF_TALK")
             return True
         elif action.type == "PLAY_ANIMATION" and action.animation_id:
             animation_text = {
@@ -1474,6 +2000,20 @@ class StreamMetadataPusher:
             "started_at": state.started_at,
             "version": state.version,
         }
+
+    def _committed_stream_semantic_context(self) -> Optional[StreamSemanticContext]:
+        """Project already-read facts without recursively refreshing the schedule."""
+        if (
+            not self._metadata.is_live or not self._current_mainline
+            or self._current_mainline.stream_session_id != self._metadata.stream_session_id
+        ):
+            return None
+        return StreamSemanticContext.from_committed(self._current_mainline, self._current_activity)
+
+    def get_stream_semantic_context(self) -> Optional[StreamSemanticContext]:
+        """One refresh supplies coherent facts to normal/SC replies and stage speech."""
+        self._refresh_schedule()
+        return self._committed_stream_semantic_context()
 
     def get_theme_prompt_context(self) -> dict:
         """直播中返回按场次冻结的主题；下播时返回当前自然日主题。"""

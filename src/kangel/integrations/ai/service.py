@@ -1,10 +1,11 @@
-"""OpenAI-compatible chat completions client with multi-provider support."""
+"""Multi-provider AI client for OpenAI-compatible and Gemini REST protocols."""
 
 import asyncio
 import json
 import logging
 import socket
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import threading
@@ -57,7 +58,7 @@ def _parse_hhmm(value: str) -> int:
 
 
 class AIService:
-    """统一调用支持 OpenAI Chat Completions 格式的模型服务。
+    """统一调用支持 OpenAI Chat Completions 和 Gemini 原生 REST 的模型服务。
 
     多供应商模式（providers 非空时生效）：
       1. 按启用状态和时间段过滤供应商
@@ -78,13 +79,24 @@ class AIService:
         headers: Dict[str, str],
         payload: Dict[str, Any],
         timeout: int,
+        proxy_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
             headers={**headers, "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # urllib's module-level opener inherits HTTP(S)_PROXY from the process
+        # environment.  Provider routing must be explicit: a configured proxy
+        # applies only to this request, while the default path deliberately
+        # installs an empty ProxyHandler so unrelated providers go direct.
+        proxy_map = (
+            {"http": proxy_url, "https": proxy_url}
+            if proxy_url
+            else {}
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxy_map))
+        with opener.open(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     @staticmethod
@@ -105,6 +117,8 @@ class AIService:
     @staticmethod
     def _get_model_for_role(provider: AIProvider, role: str) -> str:
         """根据角色获取模型；Viewer Impression 不允许静默回退普通主播模型。"""
+        if provider.roles is not None and role not in provider.roles:
+            return ""
         models = provider.models
         role_model = getattr(models, role, None)
         if role in IMPRESSION_ROLES:
@@ -138,6 +152,8 @@ class AIService:
                 name="legacy",
                 base_url=settings.ai.base_url,
                 api_key=settings.ai.api_key,
+                proxy_url=settings.ai.proxy_url,
+                protocol=settings.ai.protocol,
             )
             return [(pseudo, model)]
 
@@ -208,6 +224,8 @@ class AIService:
                     {
                         "provider": provider.name,
                         "model": model,
+                        "protocol": provider.protocol,
+                        "proxy_enabled": bool(provider.proxy_url),
                         "reasoning_effort": self._reasoning_effort(provider, role),
                     }
                     for provider, model in self._select_providers(role)
@@ -226,42 +244,78 @@ class AIService:
         stream: bool,
         response_format: Optional[Dict[str, Any]],
         timeout: int,
+        protocol: str = "openai",
+        proxy_url: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         background: bool = False,
     ) -> Tuple[str, Optional[Dict[str, int]]]:
         """返回 (正文, token 用量)；用量缺失时第二项为 None（审计记为未上报）。"""
         if stream:
-            raise ValueError("当前服务端只支持非流式 OpenAI-compatible 响应")
+            raise ValueError("当前服务端只支持非流式模型响应")
 
-        url = base_url.rstrip("/") + "/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": _USER_AGENT,
-        }
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": False,
-        }
-        if reasoning_effort:
-            # 仅由 provider capability 显式开启；不向所有兼容网关泄漏私有参数。
-            payload["reasoning_effort"] = reasoning_effort
+        if protocol == "gemini":
+            url, headers, payload = self._build_gemini_request(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                response_format=response_format,
+                reasoning_effort=reasoning_effort,
+            )
+        elif protocol == "openai":
+            url = base_url.rstrip("/") + "/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": _USER_AGENT,
+            }
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "stream": False,
+            }
+            if reasoning_effort:
+                # 仅由 provider capability 显式开启；不向所有兼容网关泄漏私有参数。
+                payload["reasoning_effort"] = reasoning_effort
 
-        # 兼容供应商对 JSON Schema 的实现并不统一；调用方会继续在后端校验。
-        _ = response_format
+            # 兼容供应商对 JSON Schema 的实现并不统一；调用方会继续在后端校验。
+            _ = response_format
+        else:  # 防止直接调用内部方法时静默走错协议。
+            raise ValueError(f"不支持的 AI 协议: {protocol}")
         if background:
             if not _IMPRESSION_HTTP_SLOTS.acquire(blocking=False):
                 raise AIBackgroundBusy("background_http_capacity")
             try:
-                future = _IMPRESSION_HTTP_EXECUTOR.submit(self._post_json_sync, url, headers, payload, timeout)
+                if proxy_url:
+                    future = _IMPRESSION_HTTP_EXECUTOR.submit(
+                        self._post_json_sync, url, headers, payload, timeout, proxy_url
+                    )
+                else:
+                    # Keep the historical four-argument call shape for the
+                    # unproxied path and existing test/instrumentation hooks.
+                    future = _IMPRESSION_HTTP_EXECUTOR.submit(
+                        self._post_json_sync, url, headers, payload, timeout
+                    )
             except BaseException:
                 _IMPRESSION_HTTP_SLOTS.release()
                 raise
             future.add_done_callback(lambda _: _IMPRESSION_HTTP_SLOTS.release())
             data = await asyncio.wrap_future(future)
         else:
-            data = await asyncio.to_thread(self._post_json_sync, url, headers, payload, timeout)
+            if proxy_url:
+                data = await asyncio.to_thread(
+                    self._post_json_sync, url, headers, payload, timeout, proxy_url
+                )
+            else:
+                # Keep the historical four-argument call shape for the
+                # unproxied path and existing test/instrumentation hooks.
+                data = await asyncio.to_thread(
+                    self._post_json_sync, url, headers, payload, timeout
+                )
+        if protocol == "gemini":
+            return self._parse_gemini_response(data)
+
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ValueError("OpenAI-compatible 响应缺少 choices")
@@ -274,12 +328,206 @@ class AIService:
         return str(content), self._parse_usage(data)
 
     @staticmethod
+    def _gemini_model_name(model: str) -> str:
+        """规范化 Gemini REST 的模型名，避免 ``models/models/foo``。"""
+        value = str(model).strip()
+        if value.startswith("models/"):
+            value = value[len("models/"):]
+        if not value:
+            raise ValueError("Gemini 模型名不能为空")
+        return value
+
+    @staticmethod
+    def _message_text(message: Dict[str, str]) -> str:
+        """把常见 OpenAI content 形状收敛为 Gemini 的纯文本 part。"""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [
+                part.get("text")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ]
+            if texts:
+                return "".join(texts)
+        return "" if content is None else str(content)
+
+    @classmethod
+    def _build_gemini_request(
+        cls,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        response_format: Optional[Dict[str, Any]],
+        reasoning_effort: Optional[str],
+    ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
+        """将内部消息转换为 Google 官方 ``generateContent`` 请求。"""
+        system_texts: List[str] = []
+        contents: List[Dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role", "user")).lower()
+            text = cls._message_text(message)
+            if role in {"system", "developer"}:
+                if text:
+                    system_texts.append(text)
+                continue
+            # Gemini 使用 ``model`` 表示助手轮次；工具/未知角色降级为用户内容，
+            # 不把 OpenAI 专有 role 原样发送给官方 API。
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": [{"text": text}]})
+
+        if not contents:
+            raise ValueError("Gemini 请求至少需要一条非 system 消息")
+
+        generation_config: Dict[str, Any] = {"temperature": temperature}
+        if response_format:
+            response_type = response_format.get("type")
+            schema: Optional[Dict[str, Any]] = None
+            if response_type == "json_schema":
+                json_schema = response_format.get("json_schema")
+                if isinstance(json_schema, dict):
+                    candidate = json_schema.get("schema") or json_schema.get("json_schema")
+                    if isinstance(candidate, dict):
+                        schema = candidate
+            elif response_type == "object" and (
+                isinstance(response_format.get("properties"), dict)
+                or isinstance(response_format.get("required"), list)
+            ):
+                # Several existing prompt builders use the compact internal
+                # shape {type: "object", properties, required} rather than
+                # OpenAI's nested json_schema envelope.  Promote it to the
+                # equivalent Gemini JSON schema without changing the caller
+                # contract.
+                schema = {
+                    "type": "object",
+                    **{
+                        key: value
+                        for key, value in response_format.items()
+                        if key != "type"
+                    },
+                }
+            elif isinstance(response_format.get("schema"), dict):
+                schema = response_format["schema"]
+
+            if response_type in {"json_object", "object", "json_schema"} or schema is not None:
+                generation_config["responseMimeType"] = "application/json"
+            if schema is not None:
+                # responseJsonSchema 是 Gemini GenerateContentConfig 的原生 JSON
+                # Schema 字段；调用方仍会在后端做最终结构校验。
+                generation_config["responseJsonSchema"] = schema
+
+        if reasoning_effort and reasoning_effort != "off":
+            generation_config["thinkingConfig"] = {
+                "thinkingLevel": str(reasoning_effort).upper(),
+            }
+
+        payload: Dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": generation_config,
+        }
+        if system_texts:
+            payload["systemInstruction"] = {
+                "parts": [{"text": "\n\n".join(system_texts)}],
+            }
+
+        model_name = cls._gemini_model_name(model)
+        url = (
+            base_url.rstrip("/")
+            + "/models/"
+            + urllib.parse.quote(model_name, safe="")
+            + ":generateContent"
+        )
+        headers = {
+            "x-goog-api-key": api_key,
+            "User-Agent": _USER_AGENT,
+        }
+        return url, headers, payload
+
+    @staticmethod
+    def _parse_gemini_response(data: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, int]]]:
+        """提取 Gemini candidates 文本并映射官方 usageMetadata。"""
+        candidates = data.get("candidates") if isinstance(data, dict) else None
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("Gemini 响应缺少 candidates")
+        first = candidates[0]
+        content = first.get("content") if isinstance(first, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        texts: List[str] = []
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict) or part.get("thought") is True:
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+        if not texts:
+            finish_reason = first.get("finishReason") if isinstance(first, dict) else None
+            suffix = f" (finishReason={finish_reason})" if finish_reason else ""
+            raise ValueError(f"Gemini 响应缺少可见文本{suffix}")
+        return "".join(texts), AIService._parse_gemini_usage(data)
+
+    @staticmethod
     def _reasoning_effort(provider: AIProvider, role: str) -> Optional[str]:
-        if provider.reasoning_protocol != "openai":
+        # A reasoning encoding is meaningful only with the matching request
+        # protocol.  Do not accidentally send Gemini thinking values through
+        # an OpenAI gateway (or vice versa) when a provider is misconfigured.
+        if provider.reasoning_protocol not in {"openai", "gemini"}:
+            return None
+        if provider.reasoning_protocol != provider.protocol:
             return None
         value = getattr(provider.reasoning, role, None) or provider.reasoning.default
         # OpenAI-compatible 常用关闭值是 none；配置层使用更直观的 off。
-        return "none" if value == "off" else value
+        if provider.reasoning_protocol == "openai":
+            return "none" if value == "off" else value
+        # Gemini 原生 API 没有通用的 ``none`` thinkingLevel；关闭时省略
+        # thinkingConfig，由模型使用其默认策略，避免发送非法枚举值。
+        return None if value in {None, "off"} else value
+
+    @staticmethod
+    def _parse_gemini_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
+        """解析 Gemini ``usageMetadata``，不把缺失字段猜成已上报。"""
+        usage = data.get("usageMetadata") if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            return None
+
+        def as_int(*keys: str) -> Optional[int]:
+            for key in keys:
+                value = usage.get(key)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, float):
+                    return int(value)
+            return None
+
+        input_tokens = as_int("promptTokenCount")
+        output_tokens = as_int("candidatesTokenCount")
+        total_tokens = as_int("totalTokenCount")
+        cached = as_int("cachedContentTokenCount") or 0
+        reasoning_tokens = as_int("thoughtsTokenCount")
+        if (
+            input_tokens is None
+            and output_tokens is None
+            and total_tokens is None
+            and reasoning_tokens is None
+        ):
+            return None
+        resolved_input = max(0, input_tokens or 0)
+        resolved_output = max(0, output_tokens or 0)
+        resolved_reasoning = None if reasoning_tokens is None else max(0, reasoning_tokens)
+        total_fallback = resolved_input + resolved_output + (resolved_reasoning or 0)
+        return {
+            "input_tokens": resolved_input,
+            "output_tokens": resolved_output,
+            "cached_input_tokens": min(max(0, cached), resolved_input),
+            "reasoning_tokens": resolved_reasoning,
+            "total_tokens": max(0, total_tokens if total_tokens is not None else total_fallback),
+        }
 
     @staticmethod
     def _parse_usage(data: Dict[str, Any]) -> Optional[Dict[str, int]]:
@@ -381,6 +629,7 @@ class AIService:
         stream: bool = False,
         timeout: Optional[int] = None,
         background_preflight: Optional[Callable[[], Awaitable[None]]] = None,
+        stage_preflight: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """调用模型生成回复。
 
@@ -392,17 +641,18 @@ class AIService:
         """
         selected_temperature = settings.ai.temperature if temperature is None else temperature
         effective_timeout = timeout or settings.ai.timeout
+        preflight = stage_preflight or (background_preflight if role in IMPRESSION_ROLES else None)
 
         # Streaming is a local protocol restriction, not a provider failure;
         # validate it before entering the fallback loop so callers receive the
         # stable ValueError contract.
         if stream:
-            raise ValueError("当前服务端只支持非流式 OpenAI-compatible 响应")
+            raise ValueError("当前服务端只支持非流式模型响应")
 
         # 显式 model 仍走旧单供应商路径（向后兼容）
         if model is not None and model_mode != "role_hint":
-            if role in IMPRESSION_ROLES and background_preflight is not None:
-                await background_preflight()
+            if preflight is not None:
+                await preflight()
             started = time.perf_counter()
             try:
                 reply, usage = await self._call_model(
@@ -414,8 +664,10 @@ class AIService:
                     stream=stream,
                     response_format=response_format,
                     timeout=effective_timeout,
+                    protocol=settings.ai.protocol,
+                    **({"proxy_url": settings.ai.proxy_url} if settings.ai.proxy_url else {}),
                     reasoning_effort=None,
-                    background=role in IMPRESSION_ROLES,
+                    background=role in IMPRESSION_ROLES or stage_preflight is not None,
                 )
             except Exception as exc:
                 self._audit(
@@ -442,12 +694,12 @@ class AIService:
 
         last_error: Optional[Exception] = None
         for provider, model_name in candidates:
+            if preflight is not None:
+                await preflight()
             if role in IMPRESSION_ROLES:
                 # A foreground reply/SC may arrive while the previous provider
                 # is timing out. Recheck before fallback, outside provider error
                 # handling: yielding is not another failed model attempt.
-                if background_preflight is not None:
-                    await background_preflight()
                 if not self._is_provider_active(provider):
                     continue
             started = time.perf_counter()
@@ -461,8 +713,10 @@ class AIService:
                     stream=stream,
                     response_format=response_format,
                     timeout=effective_timeout,
+                    protocol=provider.protocol,
+                    **({"proxy_url": provider.proxy_url} if provider.proxy_url else {}),
                     reasoning_effort=self._reasoning_effort(provider, role),
-                    background=role in IMPRESSION_ROLES,
+                    background=role in IMPRESSION_ROLES or stage_preflight is not None,
                 )
                 self._audit(
                     role=role, provider=provider.name, model=model_name,

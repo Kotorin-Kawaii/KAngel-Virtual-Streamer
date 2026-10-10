@@ -35,15 +35,48 @@ class AudienceRelationshipManager:
         nickname: str,
         identity: Optional[ViewerIdentity] = None,
     ) -> AudienceRelationship:
+        relationship, expired = self._read_state(nickname, identity)
+        if expired and identity is not None:
+            # 过期即遗忘：这条副作用是账号记忆策略的一部分，行为一行不变。
+            self.database.delete_account_persona_memory(identity.account_id)
+        return relationship
+
+    def peek(
+        self,
+        nickname: str,
+        identity: Optional[ViewerIdentity] = None,
+    ) -> Optional[AudienceRelationship]:
+        """纯只读快照；返回 None 表示账号记忆已过期。
+
+        只读在线感知不能触发 `delete_account_persona_memory`：
+        那是一次真实的遗忘，把它藏在观测里就是让观测改变系统状态。过期时把
+        「答不了」交回调用方，由调用方跳过这一轮，而不是猜一个边界。
+        """
+        try:
+            relationship, expired = self._read_state(nickname, identity)
+        except Exception:
+            return None
+        return None if expired else relationship
+
+    def _read_state(
+        self,
+        nickname: str,
+        identity: Optional[ViewerIdentity],
+    ) -> tuple[AudienceRelationship, bool]:
+        """共用的纯读取核心：返回 (关系, 账号记忆是否已过期)，**不写不删**。
+
+        `get()` 与 `peek()` 都走这里。留两份读取逻辑将来一定漂，而这一路的
+        取值会进影响分析提示词，漂了就等于两个时刻看到了不同的关系事实。
+        """
         if identity is not None:
             if identity.identity_type == ViewerIdentityType.GUEST:
                 stored_guest = self._guest_relationships.get(identity.subject_id)
                 if stored_guest:
-                    return stored_guest.model_copy(deep=True)
+                    return stored_guest.model_copy(deep=True), False
                 return AudienceRelationship(
                     viewer_key=identity.subject_id,
                     nickname=identity.current_nickname,
-                )
+                ), False
 
             stored_account = self.database.get_account_audience_relationship(
                 identity.account_id
@@ -51,24 +84,24 @@ class AudienceRelationshipManager:
             preference = self.database.get_account_memory_preference(identity.account_id)
             if not preference["long_term_memory_enabled"]:
                 stored_account = None
-            if stored_account and account_memory_policy.is_expired(
+            expired = bool(stored_account) and account_memory_policy.is_expired(
                 stored_account.get("last_seen_at", "")
-            ):
-                self.database.delete_account_persona_memory(identity.account_id)
-                stored_account = None
-            if stored_account:
-                return AudienceRelationship(**stored_account)
+            )
+            if stored_account and not expired:
+                return AudienceRelationship(**stored_account), False
             return AudienceRelationship(
                 viewer_key=identity.subject_id,
                 nickname=identity.current_nickname,
-            )
+            ), expired
 
         # 仅为旧调用保留兼容路径；不得自动迁移到账号关系。
         viewer_key = self.normalize_viewer_key(nickname)
         stored = self.database.get_audience_relationship(viewer_key)
         if stored:
-            return AudienceRelationship(**stored)
-        return AudienceRelationship(viewer_key=viewer_key, nickname=nickname or "匿名宅宅")
+            return AudienceRelationship(**stored), False
+        return AudienceRelationship(
+            viewer_key=viewer_key, nickname=nickname or "匿名宅宅"
+        ), False
 
     async def observe_danmaku(
         self,

@@ -15,6 +15,7 @@ from kangel.audience.domain.identity import ViewerIdentity
 from kangel.infrastructure.bounded_work_gate import ai_reply_work_gate
 from kangel.infrastructure.database import DatabaseManager, db_manager
 from kangel.integrations.ai.service import AIService, ai_service
+from kangel.integrations.ai.persona_context import runtime_persona_system
 from kangel.shared.logging import logger
 from .runtime import account_memory_policy
 
@@ -428,7 +429,7 @@ class EpisodicMemoryManager:
                 self.database.get_stream_memory_candidate_inputs, item["candidate_ids"]
             )
             memories, reflection = await asyncio.wait_for(
-                self._summarize(inputs, ai_client),
+                self._summarize(inputs, ai_client, stream_session_id=session_id),
                 timeout=self._ai_timeout(),
             )
             memories = self._validate_memories(memories, inputs)
@@ -485,7 +486,7 @@ class EpisodicMemoryManager:
         finally:
             await lease.release()
 
-    async def _summarize(self, inputs: list[dict], ai_client: AIService) -> tuple[list[dict], Optional[dict]]:
+    async def _summarize(self, inputs: list[dict], ai_client: AIService, *, stream_session_id="") -> tuple[list[dict], Optional[dict]]:
         evidence = []
         for item in inputs[:settings.episodic_memory.max_candidates_per_session]:
             source = item.get("source") or {}
@@ -515,7 +516,9 @@ class EpisodicMemoryManager:
             })
         messages = [
             {"role": "system", "content": (
-                "你是虚拟主播的下播情景记忆整理器。只使用候选证据，输出严格 JSON，不输出思维链。"
+                runtime_persona_system(stream_session_id) + "\n"
+                "你是虚拟主播的下播情景记忆整理器，不生成公开台词。人格只用于解释情绪残留与回调建议，"
+                "事件与事实必须客观归纳，不能按人格改写证据。只使用候选证据，输出严格 JSON，不输出思维链。"
                 "不得编造人物关系、身份、处罚原因或未提供的事实；不得输出账号 ID、昵称、IP、完整原文。"
                 "直接互动语义优先于主题和背景。只允许事件类型：" + ",".join(sorted(_EVENT_TYPES))
             )},

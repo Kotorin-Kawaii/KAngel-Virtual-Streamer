@@ -19,6 +19,7 @@ from .persona import (
 )
 from kangel.shared.logging import logger
 from kangel.infrastructure.prompt_budget import prompt_budget_metrics
+from kangel.audience.application.relationship_expression import relationship_expression
 
 
 # 原始QA数据（用于初始化知识库）
@@ -568,10 +569,16 @@ class StreamerReplyPromptBuilder:
         previous_stream_summary_description = self._build_previous_stream_summary_description(memory_context)
         reply_language_description = self._build_reply_language_description(memory_context)
         emotion_continuity_description = self._build_emotion_continuity_description(emotion_context)
-        available_emotions = (
+        # 即使调用方传入了旧缓存，也只允许当前共享目录中的启用标签进入 Prompt；
+        # 这样临时下线的表达不会因 stale emotion_context 被模型重新选出。
+        configured_emotions = (
             (emotion_context or {}).get("available_emotions")
             or list(AVAILABLE_EMOTIONS)
         )
+        available_emotions = [
+            emotion for emotion in configured_emotions
+            if emotion in AVAILABLE_EMOTIONS
+        ]
         available_emotions_text = json.dumps(available_emotions, ensure_ascii=False)
         
         # 系统提示词（精简版，移除硬编码的101问）
@@ -872,25 +879,23 @@ class StreamerReplyPromptBuilder:
             return "这是暂时没有关系记录的观众，正常回应，不要假装认识很久。"
 
         nickname = relationship.get("nickname", "这位宅宅")
-        familiarity = float(relationship.get("familiarity", 0.05))
-        affinity = float(relationship.get("affinity", 0.5))
-        trust = float(relationship.get("trust", 0.5))
         strikes = int(relationship.get("boundary_strikes", 0))
         interactions = int(relationship.get("interaction_count", 0))
         replies = int(relationship.get("reply_count", 0))
         topics = relationship.get("recent_topics", []) or []
+        expression = relationship_expression(relationship)
 
         lines = [f"- 对象：{nickname}（互动 {interactions} 次，回复过 {replies} 次）"]
-        if familiarity >= 0.7:
+        if expression["level"] == "trusted":
             lines.append("- 很熟悉：可以自然接旧梗、用更亲昵或更随便的语气。")
-        elif familiarity >= 0.3:
+        elif expression["level"] == "familiar":
             lines.append("- 有些眼熟：可以表现出记得对方，但不要编造共同经历。")
         else:
             lines.append("- 关系尚浅：不要强行套近乎或声称记得不存在的往事。")
 
-        if affinity >= 0.7 and trust >= 0.6:
+        if expression["warmth"] == "warm":
             lines.append("- 好感与信任较高：更愿意撒娇、坦率回应或表达依赖。")
-        elif affinity <= 0.35 or trust <= 0.35:
+        elif expression["warmth"] == "reserved":
             lines.append("- 好感或信任偏低：保持警惕，回复可以冷淡或带刺。")
         if strikes > 0:
             lines.append(f"- 对方有 {strikes} 次越界记录：不要立刻忘记冒犯，可表现出戒备。")
@@ -1340,7 +1345,8 @@ class PersonaDecisionPromptBuilder:
     def generate_prompt(
         self,
         persona_state: dict,
-        danmaku_list: list
+        danmaku_list: list,
+        persona_stable_key: str = "",
     ) -> tuple[list[dict], dict]:
         """
         返回：
@@ -1366,7 +1372,8 @@ class PersonaDecisionPromptBuilder:
             "required": ["danmakuID", "emotion_delta"],
         }
 
-        system_prompt = f"""
+        from .persona_context import runtime_persona_system
+        system_prompt = runtime_persona_system(persona_stable_key) + f"""
 你是一个直播AI人格"超天酱"的【情绪与行为决策模块】。
 
 你的职责不是生成回复文本，而是：

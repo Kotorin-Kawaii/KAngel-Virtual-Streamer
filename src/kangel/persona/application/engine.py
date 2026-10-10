@@ -26,13 +26,16 @@ from kangel.shared.logging import logger
 from .impact_analyzer import persona_impact_analyzer
 from ..domain.dynamics import DynamicsContext, PersonaAffectAnchor
 from kangel.audience.application.relationship_service import audience_relationship_manager
+from kangel.audience.application.relationship_expression import relationship_expression
 from ..domain.events import SemanticImpactAnalyzedEvent
 from ..domain.mutations import PersonaMutation
 from .runtime import internal_state_dynamics, persona_dynamics, persona_event_pipeline
 from kangel.danmaku.application.memory import danmaku_memory_manager
 from kangel.infrastructure.database import db_manager
 from kangel.infrastructure.reply_timing import reply_timing_metrics
-from kangel.infrastructure.timing_trace import mark_current, note_current
+from kangel.infrastructure.timing_trace import (
+    mark_current, note_current, timing_trace_recorder,
+)
 from kangel.danmaku.application.pool import danmaku_pool
 from .emotion_manager import emotion_manager
 from .intent_state import StreamerIntentStateService
@@ -342,7 +345,8 @@ class PersonaEngine:
             persona_state_dict = self.state.model_dump()
             messages, response_format = persona_decision_prompt_builder.generate_prompt(
                 persona_state=persona_state_dict,
-                danmaku_list=list(message_history)
+                danmaku_list=list(message_history),
+                persona_stable_key=stream_metadata_pusher.get_current_stream_session_id() or "",
             )
             logger.info(f"生成的提示: {messages}")
             
@@ -382,27 +386,42 @@ class PersonaEngine:
         )
         processing_claim_token = None
         danmaku_id = str(danmaku_message.get("danmakuID", "") or "")
+        # WebSocket 的 P32-B 路径可在进入回复闸门前取得 claim，避免另一个
+        # worker 同时把同一条 READ 弹幕送进 AI。保留旧调用者的内部 claim
+        # 行为；只有显式携带有效 token 才视为已预占。
+        preclaimed_token = str(
+            danmaku_message.get("_processing_claim_token", "") or ""
+        ).strip()
+        processing_claim_preclaimed = bool(
+            danmaku_message.get("_processing_claim_preclaimed")
+            and preclaimed_token
+            and claim_stream_session_id
+            and danmaku_id
+        )
         if (
             reply_path == "normal"
             and not is_moderation_response
             and claim_stream_session_id
             and danmaku_id
         ):
-            processing_claim_token = uuid4().hex
-            claimed = await asyncio.to_thread(
-                db_manager.claim_danmaku_processing,
-                stream_session_id=str(claim_stream_session_id),
-                source_type="normal",
-                danmaku_id=danmaku_id,
-                claim_token=processing_claim_token,
-                lease_seconds=settings.rate_limit.ai_reply_claim_lease_seconds,
-            )
-            if not claimed:
-                logger.info(
-                    "重复普通弹幕处理已在模型调用前拒绝: session=%s danmaku_id=%s",
-                    claim_stream_session_id, danmaku_id,
+            if processing_claim_preclaimed:
+                processing_claim_token = preclaimed_token
+            else:
+                processing_claim_token = uuid4().hex
+                claimed = await asyncio.to_thread(
+                    db_manager.claim_danmaku_processing,
+                    stream_session_id=str(claim_stream_session_id),
+                    source_type="normal",
+                    danmaku_id=danmaku_id,
+                    claim_token=processing_claim_token,
+                    lease_seconds=settings.rate_limit.ai_reply_claim_lease_seconds,
                 )
-                return None
+                if not claimed:
+                    logger.info(
+                        "重复普通弹幕处理已在模型调用前拒绝: session=%s danmaku_id=%s",
+                        claim_stream_session_id, danmaku_id,
+                    )
+                    return None
         logger.info(f"[DEBUG] generate_reply 开始执行，弹幕: {danmaku_message.get('message', '')[:50]}...")
         analysis = None
         dynamics_context = None
@@ -469,15 +488,8 @@ class PersonaEngine:
                 danmaku_message.get('_viewer_identity'), danmaku_message.get('message', '')
             )
             memory_context["danmaku_rate"] = persona_event_pipeline.current_danmaku_rate
-            memory_context["daily_stream_theme"] = (
-                stream_metadata_pusher.get_theme_prompt_context()
-            )
-            memory_context["current_streamer_activity"] = (
-                stream_metadata_pusher.get_activity_prompt_context()
-            )
-            self._apply_mainline_prompt_context(
-                memory_context, stream_metadata_pusher.get_mainline_prompt_context()
-            )
+            memory_context["_persona_stable_key"] = stream_session_id or danmaku_message.get("danmakuID", "")
+            self._apply_stream_prompt_context(memory_context, stream_metadata_pusher)
             memory_context["previous_stream_summary"] = (
                 stream_metadata_pusher.get_previous_session_summary_prompt_context(
                     danmaku_message.get("message", "")
@@ -713,6 +725,8 @@ class PersonaEngine:
                 event_id=danmaku_message.get("danmakuID", ""),
                 intent_version=intent_state.version if intent_state else None,
                 stream_session_id=stream_session_id,
+                current_message=danmaku_message.get("message", ""),
+                persona_state=reaction_state.model_dump(),
             ))
 
             current_persona_state = reaction_state.model_dump()
@@ -738,13 +752,7 @@ class PersonaEngine:
             if active_prompt_mode != "legacy":
                 try:
                     relationship = memory_context.get("viewer_relationship") or {}
-                    familiarity = float(relationship.get("familiarity", 0.0) or 0.0)
-                    trust = float(relationship.get("trust", 0.0) or 0.0)
-                    relationship_scope = (
-                        "trusted"
-                        if familiarity >= 0.7 and trust >= 0.65
-                        else "familiar" if familiarity >= 0.3 else "public"
-                    )
+                    relationship_scope = relationship_expression(relationship)["evidence_scope"]
                     persona_selection = _persona_evidence_selector.select_from_legacy_matches(
                         retrieved_qa,
                         evidence_limit=settings.persona.catalog_evidence_limit,
@@ -1302,9 +1310,28 @@ class PersonaEngine:
         )
 
     @staticmethod
+    def _apply_stream_prompt_context(memory_context: dict, pusher) -> None:
+        """Shared normal/SC reply projection; read the active session only once."""
+        from kangel.stream.domain.semantic_context import unified_stream_semantics_enabled
+        unified = unified_stream_semantics_enabled(settings.stream)
+        semantic = pusher.get_stream_semantic_context() if unified else None
+        memory_context["daily_stream_theme"] = (
+            semantic.theme_prompt_context() if semantic else pusher.get_theme_prompt_context()
+        )
+        memory_context["current_streamer_activity"] = (
+            semantic.activity_prompt_context() if semantic else pusher.get_activity_prompt_context()
+        )
+        mainline = (
+            semantic.mainline_prompt_context() if semantic else
+            None if unified else pusher.get_mainline_prompt_context()
+        )
+        PersonaEngine._apply_mainline_prompt_context(memory_context, mainline)
+
+    @staticmethod
     def _apply_mainline_prompt_context(memory_context: dict, mainline_context) -> None:
-        """灰度关闭时主提示词里不出现本场主线，回退到 P26 之前的上下文形状。"""
-        if not settings.stream.mainline_prompt_injection_enabled:
+        """Active uses committed mainline facts; legacy retains its rollout flag."""
+        from kangel.stream.domain.semantic_context import unified_stream_semantics_enabled
+        if not (settings.stream.mainline_prompt_injection_enabled or unified_stream_semantics_enabled(settings.stream)):
             memory_context.pop("current_stream_mainline", None)
             return
         memory_context["current_stream_mainline"] = mainline_context
@@ -1338,8 +1365,11 @@ class PersonaEngine:
             boundary = "established"
         else:
             boundary = "standard"
+        activity_context = dict(context.get("current_streamer_activity") or {})
+        if context.get("_persona_stable_key"):
+            activity_context["_persona_stable_key"] = context["_persona_stable_key"]
         return {
-            "activity_context": context.get("current_streamer_activity"),
+            "activity_context": activity_context or None,
             "room_context": {
                 "danmaku_rate": context.get("danmaku_rate", 0),
                 "audience_sentiment": PersonaEngine._average_recent_sentiment(context),

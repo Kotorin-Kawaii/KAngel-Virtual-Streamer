@@ -5,7 +5,7 @@
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Set
 from collections import deque
 from dataclasses import dataclass, field
@@ -22,6 +22,7 @@ class DanmakuStatus(Enum):
     READ = "read"          # 已读
     SELECTED = "selected"  # 已选中（准备回复）
     REPLIED = "replied"    # 已回复
+    IGNORED_AFTER_READ = "ignored_after_read"  # 已读后主动让行
     EXPIRED = "expired"    # 已过期
 
 
@@ -45,6 +46,9 @@ class DanmakuItem:
     
     # 回复相关
     reply_content: str = ""  # 回复内容
+    read_at: Optional[str] = None
+    consumed_at: Optional[str] = None
+    consumption_reason: Optional[str] = None
     viewer_identity: Optional[ViewerIdentity] = None  # 仅供后端身份路由使用
     client_ip: Optional[str] = None  # 仅供后端容量与滥用防护使用
     
@@ -60,7 +64,10 @@ class DanmakuItem:
             "reply_count": self.reply_count,
             "content_score": self.content_score,
             "emotional_match_score": self.emotional_match_score,
-            "reply_content": self.reply_content
+            "reply_content": self.reply_content,
+            "read_at": self.read_at,
+            "consumed_at": self.consumed_at,
+            "consumption_reason": self.consumption_reason,
         }
     
     def is_expired(self, time_window_minutes: int = None) -> bool:
@@ -87,6 +94,11 @@ class DanmakuPool:
         self._unread_pool: deque = deque(maxlen=settings.danmaku.max_unread_pool_size)
         self._read_pool: deque = deque(maxlen=settings.danmaku.max_unread_pool_size)
         self._replied_ids: Set[str] = set()  # 已回复的弹幕ID集合
+        self._ignored_ids: Set[str] = set()  # 已读后主动忽略的弹幕ID集合
+        # 仅用于进程重启后恢复「已提交 READ、尚未终态」的条目。普通的
+        # mark_as_read 不会加入这里，避免同一条正在处理的弹幕被并发重选。
+        self._recovered_read_ids: Set[str] = set()
+        self._reply_timestamps: deque[datetime] = deque(maxlen=256)
         self._lock = asyncio.Lock()
         
         # 统计信息
@@ -123,45 +135,127 @@ class DanmakuPool:
         
         logger.debug(f"弹幕池：添加新弹幕 [ID: {danmaku_id}] 来自 {nickname}")
         return item
-    
-    async def mark_as_read(self, danmaku_id: str) -> bool:
-        """标记弹幕为已读"""
+
+    async def restore_read_danmaku(
+        self,
+        *,
+        danmaku_id: str,
+        nickname: str,
+        message: str,
+        timestamp: datetime,
+        read_at: str,
+    ) -> bool:
+        """恢复崩溃前已 READ、但尚未提交终态的弹幕。
+
+        这是一个仅供启动恢复使用的内部入口。恢复项带有独立标记，只有
+        它们会进入 selector 的 READ 候选；正常处理中的 READ 项不会因此
+        被第二个 worker 抢走。
+        """
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone().replace(tzinfo=None)
+        item = DanmakuItem(
+            id=str(danmaku_id),
+            nickname=str(nickname or ""),
+            message=str(message or ""),
+            timestamp=timestamp,
+            status=DanmakuStatus.READ,
+            read_at=str(read_at),
+        )
         async with self._lock:
-            for item in self._unread_pool:
-                if item.id == danmaku_id:
+            if any(
+                existing.id == item.id
+                for pool in (self._unread_pool, self._read_pool)
+                for existing in pool
+            ):
+                return False
+            self._read_pool.append(item)
+            self._recovered_read_ids.add(item.id)
+            self._recovered_read_ids.intersection_update(
+                {existing.id for existing in self._read_pool}
+            )
+        logger.info("恢复 P32-B read_pending 弹幕 [ID: %s]", item.id)
+        return True
+    
+    async def mark_as_read(self, danmaku_id: str, *, read_at: Optional[str] = None) -> bool:
+        """标记弹幕为已读；SELECTED/UNREAD 均可安全转入 READ。"""
+        read_at = read_at or datetime.now(timezone.utc).isoformat()
+        async with self._lock:
+            for item in list(self._unread_pool):
+                if item.id != danmaku_id:
+                    continue
+                if item.status in (DanmakuStatus.REPLIED, DanmakuStatus.IGNORED_AFTER_READ,
+                                   DanmakuStatus.EXPIRED):
+                    return False
+                item.status = DanmakuStatus.READ
+                item.read_at = item.read_at or read_at
+                self._unread_pool.remove(item)
+                self._read_pool.append(item)
+                logger.debug(f"弹幕池：标记为已读 [ID: {danmaku_id}]")
+                return True
+            for item in self._read_pool:
+                if item.id == danmaku_id and item.status in (
+                    DanmakuStatus.READ, DanmakuStatus.SELECTED,
+                ):
                     item.status = DanmakuStatus.READ
-                    self._unread_pool.remove(item)
-                    self._read_pool.append(item)
-                    logger.debug(f"弹幕池：标记为已读 [ID: {danmaku_id}]")
+                    item.read_at = item.read_at or read_at
+                    return True
+        return False
+
+    async def mark_as_ignored_after_read(
+        self, danmaku_id: str, *, consumed_at: Optional[str] = None
+    ) -> bool:
+        """将已读/已选弹幕原子地标为终态 IGNORE_AFTER_READ。"""
+        consumed_at = consumed_at or datetime.now(timezone.utc).isoformat()
+        async with self._lock:
+            for pool in (self._unread_pool, self._read_pool):
+                for item in pool:
+                    if item.id != danmaku_id:
+                        continue
+                    if item.status == DanmakuStatus.IGNORED_AFTER_READ:
+                        return False
+                    if item.status == DanmakuStatus.REPLIED:
+                        return False
+                    if item.status not in (DanmakuStatus.READ, DanmakuStatus.SELECTED):
+                        return False
+                    item.status = DanmakuStatus.IGNORED_AFTER_READ
+                    item.read_at = item.read_at or consumed_at
+                    item.consumed_at = item.consumed_at or consumed_at
+                    item.consumption_reason = "ignored_after_read"
+                    self._ignored_ids.add(danmaku_id)
+                    self._recovered_read_ids.discard(danmaku_id)
+                    logger.info(f"弹幕池：标记为已读后忽略 [ID: {danmaku_id}]")
                     return True
         return False
     
     async def mark_as_replied(self, danmaku_id: str, reply_content: str = "") -> bool:
         """标记弹幕为已回复"""
         async with self._lock:
-            # 在未读池中查找
-            for item in self._unread_pool:
-                if item.id == danmaku_id:
+            for pool in (self._unread_pool, self._read_pool):
+                for item in pool:
+                    if item.id != danmaku_id:
+                        continue
+                    if item.status in (DanmakuStatus.REPLIED, DanmakuStatus.IGNORED_AFTER_READ,
+                                       DanmakuStatus.EXPIRED):
+                        return False
                     item.status = DanmakuStatus.REPLIED
                     item.reply_count += 1
                     item.reply_content = reply_content
+                    now_text = datetime.now(timezone.utc).isoformat()
+                    item.read_at = item.read_at or now_text
+                    item.consumed_at = item.consumed_at or now_text
+                    item.consumption_reason = "replied"
                     self._replied_ids.add(danmaku_id)
-                    self._stats["total_replied"] += 1
-                    logger.info(f"弹幕池：标记为已回复 [ID: {danmaku_id}]")
-                    return True
-            
-            # 在已读池中查找
-            for item in self._read_pool:
-                if item.id == danmaku_id:
-                    item.status = DanmakuStatus.REPLIED
-                    item.reply_count += 1
-                    item.reply_content = reply_content
-                    self._replied_ids.add(danmaku_id)
+                    self._recovered_read_ids.discard(danmaku_id)
                     self._stats["total_replied"] += 1
                     logger.info(f"弹幕池：标记为已回复 [ID: {danmaku_id}]")
                     return True
         
         return False
+
+    async def record_successful_reply(self) -> None:
+        """Record only a terminally committed and successfully broadcast reply."""
+        async with self._lock:
+            self._reply_timestamps.append(datetime.now(timezone.utc))
 
     async def release_selection(self, danmaku_id: str) -> bool:
         """AI 容量不足时把尚未处理的选中项安全放回候选池。"""
@@ -174,6 +268,8 @@ class DanmakuPool:
                             if pool is self._unread_pool
                             else DanmakuStatus.READ
                         )
+                        if pool is self._read_pool:
+                            self._recovered_read_ids.add(danmaku_id)
                         return True
         return False
 
@@ -183,7 +279,10 @@ class DanmakuPool:
             for pool in (self._unread_pool, self._read_pool):
                 for item in pool:
                     if item.id == danmaku_id and item.is_available_for_reply():
+                        if pool is self._read_pool and item.id not in self._recovered_read_ids:
+                            continue
                         item.status = DanmakuStatus.SELECTED
+                        self._recovered_read_ids.discard(danmaku_id)
                         return True
         return False
     
@@ -207,10 +306,16 @@ class DanmakuPool:
         await self._cleanup_expired()
         
         async with self._lock:
-            return [
+            unread = [
                 item for item in self._unread_pool 
                 if item.is_available_for_reply()
             ]
+            recovered = [
+                item for item in self._read_pool
+                if item.id in self._recovered_read_ids
+                and item.is_available_for_reply()
+            ]
+            return unread + recovered
     
     async def _cleanup_expired(self):
         """清理过期弹幕"""
@@ -229,6 +334,7 @@ class DanmakuPool:
                 if item.is_expired():
                     item.status = DanmakuStatus.EXPIRED
                     self._read_pool.remove(item)
+                    self._recovered_read_ids.discard(item.id)
                     expired_count += 1
             
             if expired_count > 0:
@@ -245,10 +351,38 @@ class DanmakuPool:
             "unread_count": len(self._unread_pool),
             "read_count": len(self._read_pool),
             "replied_count": len(self._replied_ids),
+            "ignored_after_read_count": len(self._ignored_ids),
             "total_received": self._stats["total_received"],
             "total_replied": self._stats["total_replied"],
             "total_expired": self._stats["total_expired"]
         }
+
+    async def get_recent_reply_signal(self, window_seconds: float = 60.0) -> dict:
+        """Return a process-local aggregate; never includes reply text or identity."""
+        window_seconds = max(1.0, float(window_seconds))
+        now = datetime.now(timezone.utc)
+        async with self._lock:
+            recent = [
+                timestamp for timestamp in self._reply_timestamps
+                if (now - timestamp).total_seconds() <= window_seconds
+            ]
+            self._reply_timestamps = deque(recent, maxlen=256)
+            last = max(self._reply_timestamps) if self._reply_timestamps else None
+        return {
+            "count": len(recent),
+            "seconds_since_last_reply": (
+                max(0.0, (now - last).total_seconds()) if last else None
+            ),
+        }
+
+    async def has_pending_reply_work(self) -> bool:
+        """Return whether a READ/SELECTED item still owns the reply lifecycle."""
+        async with self._lock:
+            return any(
+                item.status in {DanmakuStatus.READ, DanmakuStatus.SELECTED}
+                for pool in (self._unread_pool, self._read_pool)
+                for item in pool
+            )
     
     def get_pool_status(self) -> dict:
         """获取弹幕池详细状态"""

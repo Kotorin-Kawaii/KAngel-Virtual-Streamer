@@ -493,6 +493,8 @@ var PANELS = [
   { group: "直播", title: "直播元信息", path: "/stream/metadata" },
   { group: "直播", title: "元信息推送统计", path: "/stream/metadata/stats" },
   { group: "直播", title: "活动记录", path: "/stream/activities", params: [{ name: "limit", value: "20" }] },
+  { group: "直播", title: "Live Presence / SpeechThread", path: "/admin/live-presence",
+    note: "舞台状态、短期话题、Shadow/Active 开关与进程指标；Thread 默认关闭" },
   { group: "直播", title: "心情推送统计", path: "/mood/pusher/stats" },
 
   { group: "安全与限流", title: "运行指标", path: "/admin/security/stats" },

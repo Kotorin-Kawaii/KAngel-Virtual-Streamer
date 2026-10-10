@@ -71,6 +71,9 @@ class SCConsumer:
         if lease is None:
             await asyncio.to_thread(self.service.release_claim, item["sc_id"])
             return False
+        from kangel.stream.application.metadata import stream_metadata_pusher
+        thread_handle = await stream_metadata_pusher.begin_speech_thread_reply(item["sc_id"], "sc")
+        thread_reply_visible = False
         try:
             await self._broadcast_status(item, "processing")
             principal = VerifiedAccountPrincipal.from_authentication(
@@ -127,7 +130,7 @@ class SCConsumer:
                 logger.warning("记录 SC P24 情景记忆候选失败 [%s]: %s", item["sc_id"], exc)
             broadcast_started_at = perf_counter()
             try:
-                await connection_manager.broadcast_json({
+                sent = await connection_manager.broadcast_json({
                     "type": WebSocketEventType.AI_REPLY,
                     "data": {
                         "danmaku_id": item["sc_id"],
@@ -138,7 +141,8 @@ class SCConsumer:
                         "reply": reply_data,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
-                })
+                }, **({"delivery_report": True} if thread_handle else {}))
+                thread_reply_visible = bool(sent) if thread_handle else False
             finally:
                 reply_timing_metrics.record(
                     "broadcast", (perf_counter() - broadcast_started_at) * 1000,
@@ -212,6 +216,7 @@ class SCConsumer:
             return True
         finally:
             await lease.release()
+            await stream_metadata_pusher.finish_speech_thread_reply(thread_handle, thread_reply_visible)
 
     @staticmethod
     async def _broadcast_status(

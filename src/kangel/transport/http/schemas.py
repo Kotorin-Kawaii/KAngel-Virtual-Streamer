@@ -7,6 +7,7 @@ from .resource_schemas import (
     MemoryPreferenceResponse, MemoryPreferenceUpdateRequest,
     ViewerImpressionLetter, ViewerImpressionGeneration,
     ViewerImpressionStatusResponse, ViewerImpressionGenerateResponse,
+    PublicStatsToday, PublicStatsAllTime, PublicStatsResponse,
 )
 from .resource_schemas import (
     SCConfigResponse, SCSubmitRequest, SCSubmitResponse, SCStatusResponse,

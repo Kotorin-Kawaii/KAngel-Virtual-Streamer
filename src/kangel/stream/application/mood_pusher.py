@@ -4,7 +4,6 @@
 """
 
 import asyncio
-import json
 from datetime import datetime
 from typing import Set, Dict, Any
 from fastapi import WebSocket
@@ -12,6 +11,7 @@ from fastapi import WebSocket
 from config import settings
 from kangel.shared.logging import logger
 from kangel.persona.application.engine import persona_engine
+from kangel.transport.websocket.connection_manager import connection_manager
 from kangel.transport.websocket.protocol import WebSocketEventType
 
 
@@ -113,7 +113,9 @@ class MoodPusher:
         async with self._lock:
             for websocket in self._subscribers:
                 try:
-                    await websocket.send_text(json.dumps(message, ensure_ascii=False))
+                    # 与回复、元数据等所有其他推送共用 ConnectionManager 的
+                    # 单连接发送队列，避免多个协程并发写同一条 WebSocket。
+                    await connection_manager.send_json_to(websocket, message)
                 except Exception as e:
                     logger.error(f"发送心情数据失败: {e}")
                     disconnected.add(websocket)
@@ -137,7 +139,7 @@ class MoodPusher:
                 "data": mood_data,
                 "timestamp": datetime.now().isoformat()
             }
-            await websocket.send_text(json.dumps(message, ensure_ascii=False))
+            await connection_manager.send_json_to(websocket, message)
         except Exception as e:
             logger.error(f"发送心情数据给新客户端失败: {e}")
     

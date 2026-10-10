@@ -33,9 +33,13 @@
 - pipeline 保存有界已处理 ID 集，同一进程内重复事件不会重复修改状态。
 - WebSocket 弹幕使用 `danmaku:<danmakuID>` 作为原始事件 ID，语义事件引用该来源。
 
-## 回放日志
+## 回放日志与历史保留
 
-正式记录写入 SQLite `persona_event_log`，字段包括事件 ID/类型/UTC 时间/来源、脱敏 payload、mutation、前后状态和 pipeline 版本。写入适配器会移除昵称、弹幕正文、房管目标与理由；内存最近 100 条仅用于调试，不作为正式日志。
+有业务价值的事件写入 SQLite `persona_event_log`，字段包括事件 ID/类型/UTC 时间/来源、脱敏 payload、mutation、前后状态和 pipeline 版本。写入适配器会移除昵称、弹幕正文、房管目标与理由；内存最近 100 条仅用于调试，不作为正式日志。
+
+`source=timer` 的 `silence_tick` 和 `audience_atmosphere_tick` 仍会经过 reducer、观察者和内存调试历史，但不再把每次 tick 的完整 JSON 追加到 `persona_event_log`。它们是运行信号，不是需要逐条回放的业务事实。
+
+`persona_state` 与 `persona_internal_state` 仅保留最近 10 条快照。数据库写入路径最多每小时触发一次清理，避免在每个 tick 之外再制造额外写事务；显式 `clear_old_data()` 也会同时清理两张状态表。当前状态读取仍使用各表最新记录，清理不会影响直播主链。
 
 ## 状态所有权
 

@@ -23,7 +23,7 @@ Swagger UI：http://localhost:8000/docs
 AUTH__COOKIE_SECURE=true
 ```
 
-跨域部署时，后端 `CORS__ALLOWED_ORIGINS` 必须包含前端的精确 Origin（协议、域名和端口），例如 `https://kangel.kotorin.cn`。前端请求认证接口时设置 `credentials: "include"`；服务端允许凭据，因此不会接受 `*` 来源。
+跨域部署时，后端 `CORS__ALLOWED_ORIGINS` 必须包含前端的精确 Origin（协议、域名和端口），例如 `https://frontend.example.com`。前端请求认证接口时设置 `credentials: "include"`；服务端允许凭据，因此不会接受 `*` 来源。
 
 当前 GitHub Pages 前端是跨站部署，登录 Cookie 使用 `HttpOnly; Secure; SameSite=None; Partitioned`（CHIPS）。`AUTH__COOKIE_DOMAIN` 默认留空，Cookie 只发送回 API 域名且按顶级站点分区；不要由前端读取或复制令牌。
 
@@ -625,10 +625,12 @@ type EmotionListResponse = {
 };
 ```
 
-当前共 34 个值，按表现语义分组如下：
+当前共 33 个启用值，按表现语义分组如下。`害羞`（前端对应素材路径为
+`害羞/小动作`）目前因表现争议临时下线，不会由后端列表、Prompt 或回复输出返回；
+历史素材和历史记录不因此删除，前端应继续为未知或历史值提供兜底：
 
 - 正向：`开心`、`喜欢`、`得意`、`卖萌`、`兴奋`、`温柔`
-- 亲密/表现：`害羞`、`撒娇`、`自恋`、`做作`、`帅气`、`打招呼`
+- 亲密/表现：`撒娇`、`自恋`、`做作`、`帅气`、`打招呼`
 - 负向：`生气`、`委屈`、`无语`、`尴尬`、`伤心`、`焦虑`、`疲惫`、`厌恶`、`害怕`
 - 强烈/阴暗：`阴暗`、`暴怒`、`嘲讽`、`崩溃`、`冷笑`、`震惊`
 - 中性/动作：`眼神飘忽`、`祷告`、`认真`、`思考`、`惊讶`、`搞怪`、`宅系`

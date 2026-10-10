@@ -23,6 +23,7 @@ FACT_TYPES = frozenset({"SET_MAINLINE_BEAT", "CHANGE_ACTIVITY"})
 PERFORMANCE_TYPES = frozenset({"SPEAK", "PLAY_ANIMATION"})
 TEMPLATE_FAMILIES = frozenset({
     "GAME_FATIGUE", "HIGH_STRESS", "RETURN_MAINLINE", "QUIET_GAME_COMMENTARY",
+    "QUIET_CHAT_COMMENTARY", "QUIET_STAGE_COMMENTARY",
 })
 ANIMATION_IDS = frozenset({"stretch", "short_pause", "celebrate", "glance_chat"})
 
@@ -502,6 +503,14 @@ class DirectorPerformanceTemplates:
         "QUIET_GAME_COMMENTARY": {
             "low": (("认真", "这里得认真一点了。"), ("思考", "嗯……这段有点难。")),
         },
+        "QUIET_CHAT_COMMENTARY": {
+            "low": (("思考", "突然安静下来，反而有点不习惯。"),
+                    ("平静", "嗯……稍微发会儿呆也不错。")),
+        },
+        "QUIET_STAGE_COMMENTARY": {
+            "low": (("思考", "嗯……接下来做点什么好呢。"),
+                    ("平静", "先稍微整理一下思路。")),
+        },
     }
 
     def render(
@@ -836,10 +845,109 @@ class StreamDirectorRuntime:
             context["speak_suppressed"] = True
         return True
 
+    async def perform_authorized_performance(
+        self,
+        action: PerformanceAction,
+        *,
+        stream_session_id: str,
+        beat_version: int,
+        activity_version: int,
+    ) -> bool:
+        """Execute one externally authorized performance through Director gates."""
+        if action.type not in PERFORMANCE_TYPES:
+            return False
+        if action.type == "SPEAK" and action.template_family not in TEMPLATE_FAMILIES:
+            return False
+        latest = self.context_provider()
+        if not latest or latest.get("busy"):
+            return False
+        mainline = latest.get("mainline")
+        activity = latest.get("activity")
+        if (
+            mainline is None
+            or activity is None
+            or mainline.stream_session_id != stream_session_id
+            or mainline.beat_version != int(beat_version)
+            or activity.version != int(activity_version)
+        ):
+            return False
+        if not self._performance_allowed(latest):
+            return False
+        if action.type == "SPEAK" and latest.get("speak_suppressed"):
+            return False
+        latest["live_presence_self_talk_authorized"] = True
+        performed = await self.on_performance(action, latest)
+        if not performed:
+            return False
+        now_mono = time.monotonic()
+        self._stats["performances"] += 1
+        self._last_public_at = now_mono
+        if action.type == "SPEAK":
+            self._last_speak_at = now_mono
+        self._increment_public(stream_session_id, action.type)
+        self.signals.record_activity()
+        return True
+
     def _increment_public(self, session_id: str, action_type: str) -> None:
         counts = self._session_counts.setdefault(session_id, {})
         counts["public"] = counts.get("public", 0) + 1
         counts[action_type] = counts.get(action_type, 0) + 1
+
+    def thread_performance_block_reason(self, context: dict, *, opening: bool) -> str | None:
+        """Explain the existing stage-speech gate without changing its policy."""
+        if not settings.stream.director_performance_enabled:
+            return "director_performance_disabled"
+        if context.get("viewer_count", 0) <= 0:
+            return "no_viewers"
+        if context.get("busy"):
+            return "director_busy"
+
+        now = time.monotonic()
+        if opening:
+            if now - self._started_at < settings.stream.director_public_action_cooldown_seconds:
+                return "director_startup_cooldown"
+            if now - self._last_public_at < settings.stream.director_public_action_cooldown_seconds:
+                return "director_public_cooldown"
+        counts = self._session_counts.get(context["mainline"].stream_session_id, {})
+        if counts.get("public", 0) >= settings.stream.director_max_public_actions_per_stream:
+            return "director_public_quota"
+        if counts.get("SPEAK", 0) >= settings.stream.director_max_speaks_per_stream:
+            return "director_speak_quota"
+        if opening:
+            if now - self._last_speak_at < settings.stream.director_speak_cooldown_seconds:
+                return "director_speak_cooldown"
+        elif now - self._last_public_at < settings.stream.live_presence_thread_interval_seconds:
+            return "thread_interval"
+        return None
+
+    def thread_performance_allowed(self, context: dict, *, opening: bool) -> bool:
+        return self.thread_performance_block_reason(context, opening=opening) is None
+
+    def record_thread_performance(self, session_id: str) -> None:
+        self._last_public_at = self._last_speak_at = time.monotonic()
+        self._stats["performances"] += 1
+        self._increment_public(session_id, "SPEAK")
+        self.signals.record_activity()
+
+    def greeting_performance_block_reason(self, context: dict) -> str | None:
+        """Greeting has cooldown/priority gates, deliberately no count budget."""
+        if not settings.stream.director_performance_enabled:
+            return "active_disabled"
+        if context.get("viewer_count", 0) <= 0 or context.get("busy"):
+            return "busy"
+        if time.monotonic() - self._last_public_at < min(
+            settings.stream.audience_greeting_global_cooldown_seconds,
+            settings.stream.live_presence_thread_interval_seconds,
+        ):
+            return "stage_cooldown"
+        return None
+
+    def record_greeting_performance(self) -> None:
+        self._last_public_at = self._last_speak_at = time.monotonic()
+        self._stats["performances"] += 1
+        self._stats["audience_greetings"] = self._stats.get("audience_greetings", 0) + 1
+        # Do not consume Thread/Director counts; synchronize shared stage cooldown only.
+        self.signals.record_activity()
 
     def _ai_allowed(
         self, context: dict[str, Any], signals: DirectorSignalSnapshot

@@ -6,6 +6,8 @@ SQLite 数据库实现
 import sqlite3
 import json
 import hashlib
+import threading
+import time
 import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,7 @@ from pathlib import Path
 
 from config import settings
 from kangel.shared.logging import logger
+from kangel.shared.time import parse_timestamp_as_utc
 from .migrations import upgrade_stream_memory_reliability_v1
 
 
@@ -22,6 +25,10 @@ class DatabaseManager:
 
     SQLITE_TIMEOUT_SECONDS = 5.0
     SQLITE_BUSY_TIMEOUT_MS = 5000
+    # 人格状态表只承担最近状态恢复/诊断用途，不作为无限增长的事件历史。
+    PERSONA_STATE_HISTORY_LIMIT = 10
+    # 清理是低频维护动作，避免每个 tick 都额外打开一次写事务。
+    PERSONA_STATE_CLEANUP_INTERVAL_SECONDS = 3600.0
     
     def __init__(self, db_path: str = None):
         if db_path is None:
@@ -31,6 +38,8 @@ class DatabaseManager:
             db_path = str(data_dir / "stream_data.db")
         
         self.db_path = db_path
+        self._persona_history_cleanup_lock = threading.Lock()
+        self._last_persona_history_cleanup_at = 0.0
         self._init_database()
         logger.info(f"数据库初始化成功: {db_path}")
     
@@ -75,6 +84,17 @@ class DatabaseManager:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # P32-B：把「已读」与「已消费（回复/忽略）」作为弹幕自身的
+            # 生命周期事实保存。字段全部可空，保证旧库和旧调用者继续兼容；
+            # 运行状态不写入 Live Presence 的 shadow 表。
+            danmaku_columns = {
+                row[1] for row in cursor.execute("PRAGMA table_info(danmaku_records)")
+            }
+            for column in ("read_at", "consumed_at", "consumption_reason"):
+                if column not in danmaku_columns:
+                    cursor.execute(
+                        f"ALTER TABLE danmaku_records ADD COLUMN {column} TEXT"
+                    )
             
             # 弹幕回复记录表
             cursor.execute("""
@@ -126,6 +146,9 @@ class DatabaseManager:
                     "ALTER TABLE reply_records ADD COLUMN source_type TEXT "
                     "NOT NULL DEFAULT 'legacy'"
                 )
+            # 不对历史 danmaku_records 做一次性全表回写。旧版已经写入
+            # reply_records 的弹幕由生命周期读取接口按需投影为 replied；新字段
+            # 只记录 P32-B 之后产生的 READ/消费事实，避免启动时长事务和锁住生产库。
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS danmaku_processing_claims (
@@ -617,6 +640,47 @@ class DatabaseManager:
                 "CREATE INDEX IF NOT EXISTS idx_director_commits_session_time "
                 "ON stream_director_commits(stream_session_id, committed_at DESC)"
             )
+            # P32-A Live Presence：仅保存单场舞台状态快照与低基数 Shadow 对照。
+            # state_json 自带 schema_version，方便后续线程模型演进；不把
+            # 弹幕、昵称、账号或 Prompt 内容写进这些表。
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS live_presence_sessions (
+                    stream_session_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    state_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK(version >= 1)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS live_presence_shadow_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stream_session_id TEXT NOT NULL,
+                    presence_version INTEGER NOT NULL,
+                    legacy_action TEXT NOT NULL,
+                    shadow_action TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    matched INTEGER NOT NULL,
+                    mainline_beat_version INTEGER,
+                    activity_version INTEGER,
+                    occurred_at TEXT NOT NULL,
+                    CHECK(presence_version >= 1),
+                    CHECK(matched IN (0, 1))
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_presence_observations_session_time "
+                "ON live_presence_shadow_observations(stream_session_id, occurred_at DESC)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_presence_observations_action "
+                "ON live_presence_shadow_observations(shadow_action)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_presence_observations_time "
+                "ON live_presence_shadow_observations(occurred_at)"
+            )
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS streamer_beat_events (
                     stream_session_id TEXT NOT NULL,
@@ -1102,7 +1166,12 @@ class DatabaseManager:
             # 创建索引
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_timestamp ON danmaku_records(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_reply_selected_at ON reply_records(selected_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_created_at ON accounts(created_at)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_danmaku_id ON danmaku_records(danmaku_id)")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_danmaku_consumption "
+                "ON danmaku_records(consumed_at, consumption_reason, id DESC)"
+            )
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_reply_danmaku_id ON reply_records(danmaku_id)")
             cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_reply_normal_session_danmaku
@@ -1179,6 +1248,10 @@ class DatabaseManager:
             )
             cursor.execute(
                 "INSERT OR IGNORE INTO schema_migrations(migration_id) "
+                "VALUES ('live_presence_shadow_v1')"
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id) "
                 "VALUES ('sc_queue_v1')"
             )
             cursor.execute(
@@ -1189,12 +1262,184 @@ class DatabaseManager:
                 "INSERT OR IGNORE INTO schema_migrations(migration_id) "
                 "VALUES ('sponsor_wall_v1')"
             )
+            cursor.execute(
+                "INSERT OR IGNORE INTO schema_migrations(migration_id) "
+                "VALUES ('danmaku_read_reply_v1')"
+            )
 
             # P24 reliability metadata is a formal, idempotent migration so
             # this initializer can safely open the old production database.
             upgrade_stream_memory_reliability_v1(conn)
             
             logger.debug("数据库表结构初始化完成")
+
+    # ==================== P32-A Live Presence ====================
+
+    def get_live_presence_session(self, stream_session_id: str) -> Optional[Dict[str, Any]]:
+        """读取单场 Live Presence 原子快照；不返回任何用户内容。"""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT stream_session_id, version, state_json, created_at, updated_at "
+                "FROM live_presence_sessions WHERE stream_session_id = ?",
+                (stream_session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def insert_live_presence_session(
+        self,
+        *,
+        stream_session_id: str,
+        version: int,
+        state_json: str,
+        created_at: str,
+        updated_at: str,
+    ) -> bool:
+        """幂等创建场次状态；返回是否由本次调用创建。"""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO live_presence_sessions
+                    (stream_session_id, version, state_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (stream_session_id, version, state_json, created_at, updated_at),
+            )
+            return cursor.rowcount == 1
+
+    def update_live_presence_session(
+        self,
+        *,
+        stream_session_id: str,
+        expected_version: int,
+        version: int,
+        state_json: str,
+        updated_at: str,
+    ) -> bool:
+        """按版本更新状态；冲突时不覆盖更新后的状态。"""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE live_presence_sessions
+                SET version = ?, state_json = ?, updated_at = ?
+                WHERE stream_session_id = ? AND version = ?
+                """,
+                (version, state_json, updated_at, stream_session_id, expected_version),
+            )
+            return cursor.rowcount == 1
+
+    def insert_live_presence_observation(self, observation: Dict[str, Any]) -> int:
+        """写入不含 PII 的 Shadow observation，返回自增 ID。"""
+        allowed = {
+            "stream_session_id", "presence_version", "legacy_action",
+            "shadow_action", "reason_code", "matched", "mainline_beat_version",
+            "activity_version", "occurred_at",
+        }
+        if set(observation) != allowed:
+            raise ValueError("Live Presence observation 字段不完整或包含未知字段")
+        if observation["legacy_action"] not in {
+            "ANSWER_DANMAKU", "SELF_TALK", "NO_ACTION",
+        }:
+            raise ValueError("Live Presence legacy_action 无效")
+        if observation["shadow_action"] not in {
+            "ANSWER_DANMAKU", "CONTINUE_THREAD", "IGNORE_AFTER_READ", "SELF_TALK",
+        }:
+            raise ValueError("Live Presence shadow_action 无效")
+        if observation["reason_code"] not in {
+            "SC_PRIORITY", "DANMAKU_AVAILABLE", "DANMAKU_INTERRUPT_ALLOWED",
+            "THREAD_ACTIVE", "THREAD_RESUMABLE", "ROOM_QUIET", "BUSY",
+            "NOT_LIVE", "NO_ACTION",
+        }:
+            raise ValueError("Live Presence reason_code 无效")
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO live_presence_shadow_observations (
+                    stream_session_id, presence_version, legacy_action, shadow_action,
+                    reason_code, matched, mainline_beat_version, activity_version,
+                    occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observation["stream_session_id"], observation["presence_version"],
+                    observation["legacy_action"], observation["shadow_action"],
+                    observation["reason_code"], 1 if observation["matched"] else 0,
+                    observation["mainline_beat_version"], observation["activity_version"],
+                    observation["occurred_at"],
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_live_presence_observations(
+        self, *, stream_session_id: str | None = None, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        with self._get_connection() as conn:
+            if stream_session_id:
+                rows = conn.execute(
+                    """
+                    SELECT id, stream_session_id, presence_version, legacy_action,
+                           shadow_action, reason_code, matched, mainline_beat_version,
+                           activity_version, occurred_at
+                    FROM live_presence_shadow_observations
+                    WHERE stream_session_id = ?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (stream_session_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, stream_session_id, presence_version, legacy_action,
+                           shadow_action, reason_code, matched, mainline_beat_version,
+                           activity_version, occurred_at
+                    FROM live_presence_shadow_observations
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        observations = [dict(row) for row in rows]
+        for observation in observations:
+            # SQLite stores the constrained 0/1 value as an integer; expose
+            # the contract's boolean shape to Admin callers.
+            observation["matched"] = bool(observation["matched"])
+        return observations
+
+    def count_live_presence_observations(self) -> int:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM live_presence_shadow_observations"
+            ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def cleanup_live_presence_observations(
+        self, *, cutoff_at: str, max_rows: int = 50000
+    ) -> int:
+        """低频清理 retention 与硬上界；不在回复热路径调用。"""
+        max_rows = max(1, int(max_rows))
+        removed = 0
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM live_presence_shadow_observations WHERE occurred_at < ?",
+                (cutoff_at,),
+            )
+            removed += cursor.rowcount
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM live_presence_shadow_observations"
+            ).fetchone()
+            count = int(row["count"] if row else 0)
+            if count > max_rows:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM live_presence_shadow_observations
+                    WHERE id IN (
+                        SELECT id FROM live_presence_shadow_observations
+                        ORDER BY id ASC LIMIT ?
+                    )
+                    """,
+                    (count - max_rows,),
+                )
+                removed += cursor.rowcount
+        return removed
     
     # ==================== 弹幕记录操作 ====================
     
@@ -1251,14 +1496,261 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_recent_display_messages(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """读取供 WebSocket ``history_batch`` 使用的最近展示消息。
+
+        普通弹幕和 SC 分别落在不同的持久化表，这里只投影公共展示字段，
+        返回合并后的最近 ``limit`` 条；不读取回复正文、账号或支付字段。
+        数据按数据库时间倒序返回，调用方可按展示顺序反转后写入内存队列。
+        """
+        try:
+            bounded_limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            bounded_limit = 100
+        with self._get_connection() as conn:
+            # 两张表的时间戳格式并不一致，先分别取得候选，再在 Python
+            # 中按统一的 UTC 时间排序，避免 SQLite 对 ISO 字符串做字典序比较。
+            normal_rows = conn.execute("""
+                SELECT id AS source_sequence, danmaku_id, nickname, message,
+                       timestamp, 'normal' AS type
+                FROM danmaku_records
+                ORDER BY id DESC
+                LIMIT ?
+            """, (bounded_limit,)).fetchall()
+            sc_rows = conn.execute("""
+                SELECT rowid AS source_sequence, sc_id AS danmaku_id,
+                       nickname, content AS message, accepted_at AS timestamp,
+                       'sc' AS type
+                FROM sc_queue
+                ORDER BY rowid DESC
+                LIMIT ?
+            """, (bounded_limit,)).fetchall()
+
+            rows = [dict(row) for row in (*normal_rows, *sc_rows)]
+            rows.sort(
+                key=lambda row: (
+                    parse_timestamp_as_utc(
+                        row.get("timestamp"),
+                        naive_timezone=settings.stream.timezone,
+                    ),
+                    int(row.get("source_sequence") or 0),
+                    str(row.get("danmaku_id") or ""),
+                ),
+                reverse=True,
+            )
+            for row in rows:
+                row.pop("source_sequence", None)
+            return rows[:bounded_limit]
     
     def get_danmaku_by_id(self, danmaku_id: str) -> Optional[Dict[str, Any]]:
         """根据danmaku_id获取弹幕记录"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM danmaku_records WHERE danmaku_id = ?", (danmaku_id,))
+            cursor.execute(
+                "SELECT * FROM danmaku_records WHERE danmaku_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (danmaku_id,),
+            )
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    def _danmaku_consumption_projection(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+        """Return a small lifecycle projection without exposing message/identity."""
+        data = dict(row)
+        consumed_at = data.get("consumed_at")
+        read_at = data.get("read_at")
+        if consumed_at:
+            status = "consumed"
+        elif read_at:
+            status = "read"
+        else:
+            status = "unread"
+        return {
+            "id": int(data.get("id") or 0),
+            "danmaku_id": str(data.get("danmaku_id") or ""),
+            "status": status,
+            "read_at": read_at,
+            "consumed_at": consumed_at,
+            "consumption_reason": data.get("consumption_reason"),
+        }
+
+    @staticmethod
+    def _legacy_reply_projection(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row | Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Project an old reply row without rewriting the danmaku table.
+
+        Before P32-B, ``reply_records`` was the only durable terminal fact.  Keep
+        that compatibility read-only so opening a large production database never
+        performs a bulk UPDATE just to populate the new lifecycle columns.
+        """
+        current = DatabaseManager._danmaku_consumption_projection(row)
+        if current["consumed_at"]:
+            return current
+        legacy = conn.execute(
+            "SELECT selected_at FROM reply_records "
+            "WHERE danmaku_id = ? ORDER BY id DESC LIMIT 1",
+            (current["danmaku_id"],),
+        ).fetchone()
+        if legacy is not None:
+            selected_at = legacy["selected_at"]
+            current.update(
+                status="consumed",
+                read_at=current["read_at"] or selected_at,
+                consumed_at=selected_at,
+                consumption_reason="replied",
+            )
+        return current
+
+    def get_danmaku_consumption(self, danmaku_id: str) -> Optional[Dict[str, Any]]:
+        """Read the newest lifecycle state for an external danmaku id.
+
+        A platform id is normally unique, but older deployments accepted duplicate
+        records.  Selecting the newest row makes retries deterministic without
+        rewriting historical rows.
+        """
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT id, danmaku_id, read_at, consumed_at, consumption_reason "
+                "FROM danmaku_records WHERE danmaku_id = ? ORDER BY id DESC LIMIT 1",
+                (danmaku_id,),
+            ).fetchone()
+            return self._legacy_reply_projection(conn, row) if row else None
+
+    def list_pending_read_danmaku(
+        self,
+        *,
+        limit: int = 100,
+        since_at: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List recent READ rows that still need an ANSWER/IGNORE decision.
+
+        This is the crash-recovery boundary for P32-B.  It deliberately excludes
+        rows already represented by legacy ``reply_records`` without backfilling
+        those rows, and returns only the existing danmaku fields needed to resume
+        the normal selector path.
+        """
+        try:
+            bounded_limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            bounded_limit = 100
+        query = (
+            "SELECT d.danmaku_id, d.nickname, d.message, d.timestamp, d.read_at "
+            "FROM danmaku_records AS d "
+            "WHERE d.read_at IS NOT NULL AND d.consumed_at IS NULL "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM reply_records AS r WHERE r.danmaku_id = d.danmaku_id"
+            ")"
+        )
+        params: list[Any] = []
+        if since_at:
+            query += " AND d.read_at >= ?"
+            params.append(str(since_at))
+        query += " ORDER BY d.read_at DESC, d.id DESC LIMIT ?"
+        params.append(bounded_limit)
+        with self._get_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_danmaku_read(
+        self, danmaku_id: str, read_at: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Commit the READ transition idempotently before any active decision."""
+        read_at = read_at or datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT id, danmaku_id, read_at, consumed_at, consumption_reason "
+                "FROM danmaku_records WHERE danmaku_id = ? ORDER BY id DESC LIMIT 1",
+                (danmaku_id,),
+            ).fetchone()
+            if row is None:
+                return {"status": "not_found", "danmaku_id": danmaku_id}
+            current = self._legacy_reply_projection(conn, row)
+            if current["status"] == "consumed":
+                current["status"] = "already_consumed"
+                return current
+            if current["status"] == "read":
+                current["status"] = "already_read"
+                return current
+            cursor = conn.execute(
+                "UPDATE danmaku_records SET read_at = ? "
+                "WHERE id = ? AND read_at IS NULL AND consumed_at IS NULL",
+                (read_at, current["id"]),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT id, danmaku_id, read_at, consumed_at, consumption_reason "
+                    "FROM danmaku_records WHERE id = ?",
+                    (current["id"],),
+                ).fetchone()
+                if latest is None:
+                    return {"status": "not_found", "danmaku_id": danmaku_id}
+                current = self._danmaku_consumption_projection(latest)
+                current["status"] = (
+                    "already_consumed" if current["consumed_at"]
+                    else "already_read" if current["read_at"]
+                    else "not_read"
+                )
+                return current
+            current["read_at"] = read_at
+            current["status"] = "committed"
+            return current
+
+    def consume_danmaku(
+        self,
+        danmaku_id: str,
+        reason: str,
+        consumed_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Commit one terminal consumption reason after READ.
+
+        The guarded update is the durable idempotency boundary shared by reply and
+        ``IGNORE_AFTER_READ`` workers.  It never changes a terminal reason.
+        """
+        if reason not in {"replied", "ignored_after_read"}:
+            raise ValueError("invalid danmaku consumption reason")
+        consumed_at = consumed_at or datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT id, danmaku_id, read_at, consumed_at, consumption_reason "
+                "FROM danmaku_records WHERE danmaku_id = ? ORDER BY id DESC LIMIT 1",
+                (danmaku_id,),
+            ).fetchone()
+            if row is None:
+                return {"status": "not_found", "danmaku_id": danmaku_id}
+            current = self._legacy_reply_projection(conn, row)
+            if current["consumed_at"]:
+                current["status"] = "already_consumed"
+                return current
+            if not current["read_at"]:
+                current["status"] = "not_read"
+                return current
+            cursor = conn.execute(
+                "UPDATE danmaku_records "
+                "SET consumed_at = ?, consumption_reason = ? "
+                "WHERE id = ? AND read_at IS NOT NULL AND consumed_at IS NULL",
+                (consumed_at, reason, current["id"]),
+            )
+            if cursor.rowcount != 1:
+                latest = conn.execute(
+                    "SELECT id, danmaku_id, read_at, consumed_at, consumption_reason "
+                    "FROM danmaku_records WHERE id = ?",
+                    (current["id"],),
+                ).fetchone()
+                if latest is None:
+                    return {"status": "not_found", "danmaku_id": danmaku_id}
+                current = self._danmaku_consumption_projection(latest)
+                current["status"] = (
+                    "already_consumed" if current["consumed_at"] else "not_read"
+                )
+                return current
+            current["consumed_at"] = consumed_at
+            current["consumption_reason"] = reason
+            current["status"] = "committed"
+            return current
     
     def get_danmaku_count(
         self,
@@ -1280,6 +1772,88 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return cursor.fetchone()["count"]
+
+    def get_public_stats(
+        self,
+        *,
+        local_start: str,
+        local_end: str,
+        utc_start: str,
+        utc_end: str,
+    ) -> Dict[str, Dict[str, int]]:
+        """读取匿名公开统计；时间窗口采用半开区间 ``[start, end)``。
+
+        早期弹幕/回复记录使用服务器本地的无时区 ISO 字符串，账号记录则
+        使用 UTC 偏移字符串。公开统计需要兼容这两种既有格式，因此对无偏移
+        与带偏移记录分别使用本地和 UTC 边界查询；不会把任何原始内容带出库。
+        ``source_type`` 只允许正常观众回复（含历史 ``legacy`` 记录），避免
+        将未来的导演、管理或其他内部事件误计入公开回复数。
+        """
+
+        def count_in_window(
+            conn: sqlite3.Connection,
+            table: str,
+            column: str,
+            *,
+            extra_where: str = "",
+            extra_params: tuple[Any, ...] = (),
+        ) -> int:
+            # 仅对内部固定表名/列名调用，不接受外部输入；GLOB 用于识别
+            # ``+08:00`` 这类 ISO 偏移后缀，LIKE 覆盖 ``...Z``。
+            has_offset = (
+                f"({column} GLOB '*[+-][0-9][0-9]:[0-9][0-9]' "
+                f"OR {column} LIKE '%Z')"
+            )
+            suffix = f" AND ({extra_where})" if extra_where else ""
+            naive = conn.execute(
+                f"SELECT COUNT(*) AS count FROM {table} "
+                f"WHERE NOT {has_offset} AND {column} >= ? AND {column} < ?{suffix}",
+                (local_start, local_end, *extra_params),
+            ).fetchone()["count"]
+            aware = conn.execute(
+                f"SELECT COUNT(*) AS count FROM {table} "
+                # julianday() normalizes an explicit ISO offset (not just UTC),
+                # so records written with +08:00 and +00:00 compare correctly.
+                f"WHERE {has_offset} AND julianday({column}) >= julianday(?) "
+                f"AND julianday({column}) < julianday(?) {suffix}",
+                (utc_start, utc_end, *extra_params),
+            ).fetchone()["count"]
+            return int(naive or 0) + int(aware or 0)
+
+        with self._get_connection() as conn:
+            today_replies = count_in_window(
+                conn,
+                "reply_records",
+                "selected_at",
+                extra_where="source_type IN (?, ?)",
+                extra_params=("normal", "legacy"),
+            )
+            today_danmaku = count_in_window(conn, "danmaku_records", "timestamp")
+            today_accounts = count_in_window(conn, "accounts", "created_at")
+            all_time_replies = conn.execute(
+                "SELECT COUNT(*) AS count FROM reply_records "
+                "WHERE source_type IN (?, ?)",
+                ("normal", "legacy"),
+            ).fetchone()["count"]
+            all_time_danmaku = conn.execute(
+                "SELECT COUNT(*) AS count FROM danmaku_records"
+            ).fetchone()["count"]
+            all_time_accounts = conn.execute(
+                "SELECT COUNT(*) AS count FROM accounts"
+            ).fetchone()["count"]
+
+        return {
+            "today": {
+                "replies": int(today_replies),
+                "danmaku": int(today_danmaku),
+                "new_accounts": int(today_accounts),
+            },
+            "all_time": {
+                "replies": int(all_time_replies or 0),
+                "danmaku": int(all_time_danmaku or 0),
+                "registered_accounts": int(all_time_accounts or 0),
+            },
+        }
     
     # ==================== 回复记录操作 ====================
 
@@ -1340,6 +1914,29 @@ class DatabaseManager:
                 datetime.now(timezone.utc).isoformat(),
                 stream_session_id, source_type, danmaku_id, claim_token,
             ))
+            return cursor.rowcount == 1
+
+    def release_danmaku_processing(
+        self,
+        *,
+        stream_session_id: str,
+        source_type: str,
+        danmaku_id: str,
+        claim_token: str,
+    ) -> bool:
+        """Release a preclaim when no terminal reply/ignore was committed.
+
+        Queue-full and quota-deferred paths leave the in-memory item READ so a
+        later selection can retry it.  Deleting only the current token avoids
+        allowing an older worker to release a newer claim.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM danmaku_processing_claims "
+                "WHERE stream_session_id=? AND source_type=? AND danmaku_id=? "
+                "AND status='processing' AND claim_token=?",
+                (stream_session_id, source_type, danmaku_id, claim_token),
+            )
             return cursor.rowcount == 1
 
     def claim_persona_source_event(
@@ -3111,7 +3708,75 @@ class DatabaseManager:
             ).rowcount
         return {"records": max(0, deleted)}
 
-    
+    def prune_persona_state_history(
+        self, keep: int = PERSONA_STATE_HISTORY_LIMIT
+    ) -> Dict[str, int]:
+        """保留最近的人格状态快照，避免状态表随事件 tick 无限增长。
+
+        这不是运行时状态迁移：最新状态仍然通过 ``get_latest_*`` 读取，旧快照
+        仅用于有限的诊断/恢复窗口。调用方可以显式执行该维护动作；常规保存路径
+        通过 ``_maybe_prune_persona_state_history`` 低频触发它。
+        """
+        try:
+            keep = max(1, int(keep))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("人格状态历史保留数量必须是正整数") from exc
+
+        with self._get_connection() as conn:
+            persona_deleted = conn.execute(
+                """
+                DELETE FROM persona_state
+                WHERE id NOT IN (
+                    SELECT id FROM persona_state ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (keep,),
+            ).rowcount
+            internal_deleted = conn.execute(
+                """
+                DELETE FROM persona_internal_state
+                WHERE id NOT IN (
+                    SELECT id FROM persona_internal_state ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (keep,),
+            ).rowcount
+
+        return {
+            "persona_deleted": max(0, persona_deleted),
+            "internal_persona_deleted": max(0, internal_deleted),
+        }
+
+    def _maybe_prune_persona_state_history(self) -> None:
+        """按时间节流人格状态清理，不让每个 tick 产生额外写事务。"""
+        now = time.monotonic()
+        with self._persona_history_cleanup_lock:
+            if (
+                self._last_persona_history_cleanup_at > 0
+                and
+                now - self._last_persona_history_cleanup_at
+                < self.PERSONA_STATE_CLEANUP_INTERVAL_SECONDS
+            ):
+                return
+            # 先占位，避免并发保存同时执行清理；失败时允许后续保存重试。
+            self._last_persona_history_cleanup_at = now
+
+        try:
+            result = self.prune_persona_state_history()
+            deleted = result["persona_deleted"] + result["internal_persona_deleted"]
+            if deleted:
+                logger.info(
+                    "人格状态历史低频清理完成: 删除 %s 条公开状态、%s 条内部状态",
+                    result["persona_deleted"],
+                    result["internal_persona_deleted"],
+                )
+        except Exception:
+            with self._persona_history_cleanup_lock:
+                # 只回退本次占位，避免把其他线程已经完成的新时间戳覆盖掉。
+                if self._last_persona_history_cleanup_at == now:
+                    self._last_persona_history_cleanup_at = 0.0
+            logger.exception("人格状态历史低频清理失败")
+
     def clear_old_data(self, days_to_keep: int = 30):
         """清理旧数据（默认保留30天）"""
         cutoff_time = (datetime.now() - timedelta(days=days_to_keep)).isoformat()
@@ -3127,20 +3792,35 @@ class DatabaseManager:
             cursor.execute("DELETE FROM danmaku_records WHERE timestamp < ?", (cutoff_time,))
             danmaku_deleted = cursor.rowcount
             
-            # 只保留最新的10条人格状态记录
+            # 只保留最近的人格状态快照；这条显式维护路径同时覆盖内部状态表。
             cursor.execute("""
                 DELETE FROM persona_state 
                 WHERE id NOT IN (
-                    SELECT id FROM persona_state ORDER BY updated_at DESC LIMIT 10
+                    SELECT id FROM persona_state ORDER BY id DESC LIMIT ?
                 )
-            """)
+            """, (self.PERSONA_STATE_HISTORY_LIMIT,))
             persona_deleted = cursor.rowcount
+
+            cursor.execute("""
+                DELETE FROM persona_internal_state
+                WHERE id NOT IN (
+                    SELECT id FROM persona_internal_state ORDER BY id DESC LIMIT ?
+                )
+            """, (self.PERSONA_STATE_HISTORY_LIMIT,))
+            internal_persona_deleted = cursor.rowcount
             
-            logger.info(f"清理旧数据完成: 删除了 {danmaku_deleted} 条弹幕, {reply_deleted} 条回复, {persona_deleted} 条人格状态记录")
+            logger.info(
+                "清理旧数据完成: 删除了 %s 条弹幕, %s 条回复, %s 条人格状态, %s 条内部人格状态记录",
+                danmaku_deleted,
+                reply_deleted,
+                persona_deleted,
+                internal_persona_deleted,
+            )
             return {
                 "danmaku_deleted": danmaku_deleted,
                 "reply_deleted": reply_deleted,
-                "persona_deleted": persona_deleted
+                "persona_deleted": persona_deleted,
+                "internal_persona_deleted": internal_persona_deleted,
             }
     
     # ==================== 人格状态操作 ====================
@@ -3307,7 +3987,8 @@ class DatabaseManager:
             
             record_id = cursor.lastrowid
             logger.debug(f"人格状态已保存 [ID: {record_id}]: mood={mood:.2f}, stress={stress:.2f}, darkness={darkness:.2f}")
-            return record_id
+        self._maybe_prune_persona_state_history()
+        return record_id
     
     def get_latest_persona_state(self) -> Optional[Dict[str, Any]]:
         """
@@ -3342,7 +4023,9 @@ class DatabaseManager:
                 (arousal, fatigue, attachment, confidence)
                 VALUES (?, ?, ?, ?)
             """, (arousal, fatigue, attachment, confidence))
-            return cursor.lastrowid
+            record_id = cursor.lastrowid
+        self._maybe_prune_persona_state_history()
+        return record_id
 
     def get_latest_internal_persona_state(self) -> Optional[Dict[str, Any]]:
         """读取最近一次内部人格状态。"""

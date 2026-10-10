@@ -35,6 +35,46 @@ _FORBIDDEN_OUTPUT_TERMS = (
     "数据库", "database", "system analysis", "系统分析", "用户画像", "user profile",
     "familiarity", "affinity", "trust", "confidence", "熟悉度", "信任度", "亲密度",
 )
+
+# The final content validator deliberately exposes only stable, low-detail
+# repair hints.  Never pass an exception repr or the forbidden-term table to a
+# model: those may contain private draft text and would also encourage the
+# model to echo internal vocabulary into the next draft.
+_FINAL_VALIDATOR_REPAIR_HINTS = {
+    "forbidden_internal_content": (
+        "删掉系统、模型、数据库、证据、账号、字段或报告术语；改成自然的共同经历描述，"
+        "不要解释处理过程。"
+    ),
+    "internal_or_report_content": (
+        "删掉内部处理、证据编号和报告式表述，只保留有依据的自然共同经历与主播感受。"
+    ),
+    "evidence_id_leak": (
+        "删除 content 中所有证据编号或 fragment/topic/episodic 等引用标记，保留自然语言。"
+    ),
+    "report_list_content": "去掉标题、编号和清单格式，改成一封连续、自然的私人留言。",
+    "sensitive_inference": (
+        "删除心理、疾病、身份等未经证实的敏感判断，只保留可观察行为和主播的主观感受。"
+    ),
+    "letter_too_long": "压缩信件，只保留最重要的共同经历和感受，确保不超过长度上限。",
+    "content_too_long": "压缩信件，只保留最重要的共同经历和感受，确保不超过长度上限。",
+    "invalid_json": "只返回指定的 JSON 对象，content 必须是自然留言，不要附加解释或 Markdown。",
+    "missing_content": "补齐自然的 content 字段，只返回指定的 JSON 对象。",
+    "empty_content": "写一封简短、自然的留言，不要返回空 content。",
+}
+
+
+def _final_validator_feedback(error: Exception) -> dict[str, str]:
+    """Return a bounded, model-facing repair instruction for final validation."""
+
+    raw_code = getattr(error, "code", None)
+    if not raw_code and getattr(error, "args", None):
+        raw_code = error.args[0]
+    code = str(raw_code or "validation_failed")[:80]
+    instruction = _FINAL_VALIDATOR_REPAIR_HINTS.get(
+        code,
+        "删除任何不自然的内部或报告式表述，只保留有证据的自然共同经历，保持一封简短留言。",
+    )
+    return {"code": code, "instruction": instruction}
 _EVIDENCE_SENSITIVE_PATTERNS = (
     # Values in remembered text can still contain credentials or transport
     # metadata even though those fields are not selected from the database.
@@ -554,8 +594,11 @@ class ViewerImpressionService:
             if not isinstance(parsed_snapshot, dict):
                 raise ViewerImpressionValidationError("invalid_snapshot", "证据快照格式错误")
             snapshot = parsed_snapshot
-            if snapshot.get("schema_version") == SCHEMA_VERSION:
-                result = await DeepReflectionPipeline(self.database, self.ai_client).generate(claimed, snapshot)
+            is_v2 = snapshot.get("schema_version") == SCHEMA_VERSION
+            pipeline = None
+            if is_v2:
+                pipeline = DeepReflectionPipeline(self.database, self.ai_client)
+                result = await pipeline.generate(claimed, snapshot)
             elif snapshot.get("schema_version") == LEGACY_VIEWER_IMPRESSION_VERSION:
                 # Existing frozen v1 tasks may finish after an upgrade. This is
                 # not a fallback for a new or partially executed v2 request.
@@ -569,12 +612,42 @@ class ViewerImpressionService:
                 )
             else:
                 raise ViewerImpressionValidationError("invalid_snapshot_version")
-            validated = ViewerImpressionValidator.parse(result.get("reply", ""))
-            if snapshot.get("schema_version") == SCHEMA_VERSION:
+
+            try:
+                validated = ViewerImpressionValidator.parse(result.get("reply", ""))
+                if is_v2:
+                    from .impression_models import validate_final_content
+                    validate_final_content(
+                        validated["content"],
+                        evidence_index(snapshot),
+                        min(
+                            settings.viewer_impression.max_output_chars,
+                            snapshot["pipeline_config"]["max_output_chars"],
+                        ),
+                    )
+            except Exception as validation_error:
+                # A v2 pipeline can recover from a final public-contract
+                # rejection without throwing away all completed checkpoints.
+                # The second pass is bounded by the single validator_repair
+                # checkpoint in DeepReflectionPipeline; retries reuse that
+                # checkpoint instead of looping through the whole pipeline.
+                if not is_v2 or pipeline is None:
+                    raise
+                result = await pipeline.generate(
+                    claimed,
+                    snapshot,
+                    validator_feedback=_final_validator_feedback(validation_error),
+                )
+                validated = ViewerImpressionValidator.parse(result.get("reply", ""))
                 from .impression_models import validate_final_content
-                validate_final_content(validated["content"], evidence_index(snapshot),
-                                       min(settings.viewer_impression.max_output_chars,
-                                           snapshot["pipeline_config"]["max_output_chars"]))
+                validate_final_content(
+                    validated["content"],
+                    evidence_index(snapshot),
+                    min(
+                        settings.viewer_impression.max_output_chars,
+                        snapshot["pipeline_config"]["max_output_chars"],
+                    ),
+                )
             generated_at = _iso()
             next_request_at = (
                 datetime.fromisoformat(generated_at)

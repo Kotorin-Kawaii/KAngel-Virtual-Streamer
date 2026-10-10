@@ -53,6 +53,9 @@ class ModerationCoordinator:
         # 旁路分析不在回复关键路径上（schedule 用 create_task），但 §6 要求能看到
         # 它的真实开销，所以单独记一条 moderation 序列，不混进回复链的分位数。
         analysis_started = perf_counter()
+        from kangel.stream.application.metadata import stream_metadata_pusher
+        thread_handle = None
+        thread_reply_visible = False
         try:
             try:
                 decision = await self.service.analyze_and_decide(
@@ -67,6 +70,10 @@ class ModerationCoordinator:
             if not decision or decision.action == "none":
                 return
 
+            thread_handle = await stream_metadata_pusher.begin_speech_thread_reply(
+                decision.moderation_id, "moderation"
+            )
+
             try:
                 reaction = await self._generate_reaction(
                     decision=decision, danmaku_id=danmaku_id, message=message,
@@ -78,9 +85,9 @@ class ModerationCoordinator:
                 self.service.record_reply_fallback()
                 reaction = self._fallback_reply(decision.action)
             try:
-                await self._broadcast_reaction(
+                thread_reply_visible = bool(await self._broadcast_reaction(
                     decision=decision, nickname=nickname, reply_data=reaction,
-                )
+                ))
             except Exception as exc:
                 # 广播失败不应回滚本站安全动作；连接状态可由 HTTP/重连恢复。
                 logger.warning("主播管理回复广播失败，仍提交安全动作: %s", exc)
@@ -105,6 +112,8 @@ class ModerationCoordinator:
             raise
         except Exception:
             logger.exception("主播管理异步任务失败 danmaku_id=%s", danmaku_id)
+        finally:
+            await stream_metadata_pusher.finish_speech_thread_reply(thread_handle, thread_reply_visible)
 
     async def _generate_reaction(
         self, *, decision, danmaku_id: str, message: str,
@@ -143,8 +152,8 @@ class ModerationCoordinator:
         self.service.record_reply_fallback()
         return self._fallback_reply(decision.action)
 
-    async def _broadcast_reaction(self, *, decision, nickname: str, reply_data: dict) -> None:
-        await connection_manager.broadcast_json({
+    async def _broadcast_reaction(self, *, decision, nickname: str, reply_data: dict) -> int:
+        return await connection_manager.broadcast_json({
             "type": WebSocketEventType.AI_REPLY,
             "data": {
                 "danmaku_id": decision.danmaku_id,
@@ -154,7 +163,7 @@ class ModerationCoordinator:
                 "reply": reply_data,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
-        })
+        }, delivery_report=True)
 
     async def _send_status(self, *, websocket, subject_key: str, decision) -> None:
         if websocket is None:

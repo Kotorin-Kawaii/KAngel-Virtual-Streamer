@@ -5,7 +5,7 @@ WebSocket 接收弹幕并广播事件，同时在 SQLite 中持续保存主播�
 可治理的长期记忆。回复不是一次性的“问答接口”：当前对话、主播情绪、直播活动、观众
 上下文和安全策略共同决定下一轮表现。
 
-项目使用 FastAPI、WebSocket、SQLite 和 OpenAI Chat Completions 兼容接口。除模型服务外，
+项目使用 FastAPI、WebSocket、SQLite，支持 OpenAI Chat Completions 与 Google 官方 Gemini 原生接口。除模型服务外，
 运行时不要求 Redis 或其他必需的外部服务；正式部署建议保持单 Python 进程写入一个 SQLite
 数据目录。
 
@@ -32,6 +32,9 @@ WebSocket 接收弹幕并广播事件，同时在 SQLite 中持续保存主播�
 - Sponsor Fund Transparency：可从爱发电成功订单同步匿名财务收入、登记公开资金用途，
   只对外提供聚合金额；与 nickname-only 感谢墙相互独立，默认关闭。
 - 扩展性：插件目录、完整 HTTP/WebSocket 契约、每日场次总结、赞助者感谢墙等旁路能力。
+- Live Presence / SpeechThread：可阶段开启读后不答、安静房间主动发言、短期话题中断与
+  恢复、在线感知与进房问候；所有新权限默认关闭，公开表达继续受现有人格链约束。
+- 公开统计：提供不含个人身份的直播间聚合统计 API，见 [接口说明](docs/api/PUBLIC_STATS.md)。
 
 ## 实验功能（默认保守）
 
@@ -40,6 +43,7 @@ WebSocket 接收弹幕并广播事件，同时在 SQLite 中持续保存主播�
 | 功能 | 默认状态 | 说明 |
 | --- | --- | --- |
 | Prompt RAM | 关闭 | 场次内易失的未闭合互动意图；重启后清空 |
+| Live Presence / Thread / Audience Greeting | 关闭 | 分阶段启用，操作与边界见 [Live Presence](docs/LIVE_PRESENCE.md) |
 | Stream Director / AI Director | 关闭 | 当前主线事实层可启用，Director 尚不作为生产权威 |
 | Persona Catalog | legacy、rollout 0% | 结构化人格知识可 shadow/灰度，生产仍使用 legacy Prompt |
 | Catalog exemplar | 关闭 | 不默认注入风格示例 |
@@ -53,7 +57,7 @@ WebSocket 接收弹幕并广播事件，同时在 SQLite 中持续保存主播�
 ## 运行要求
 
 - Python 3.11 或 3.12；
-- 一个实现 OpenAI Chat Completions 请求/响应格式的模型服务；
+- 一个 OpenAI Chat Completions 兼容模型服务，或 Google 官方 Gemini 原生模型服务；
 - 单进程 SQLite 数据目录；不要求 Redis。
 
 ## 快速开始
@@ -97,8 +101,9 @@ AI__VIEWER_IMPRESSION_MODEL=
 AI__VIEWER_IMPRESSION_CRITIC_MODEL=
 ```
 
-服务端统一请求 `{AI__BASE_URL}/chat/completions`。OpenAI、SiliconFlow、兼容网关或本地
-模型只要提供相同格式即可；多 Provider、角色映射和 fallback 见 `.env.example` 与接口文档。
+默认请求 `{AI__BASE_URL}/chat/completions`；Google 官方原生接口显式使用
+`AI__PROTOCOL=gemini`，OpenAI 兼容 Gemini 网关仍使用 `openai`。多 Provider 支持
+角色白名单、独立代理、时间窗与失败回退，见 `.env.example`；未配置代理的供应商直连。
 
 启动后：
 

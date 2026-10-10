@@ -17,8 +17,14 @@ EMOTION_GROUPS: Dict[str, Tuple[str, ...]] = {
     "neutral_action": ("眼神飘忽", "祷告", "认真", "思考", "惊讶", "搞怪", "宅系"),
 }
 
+# 临时安全下线的表达。保留在完整语义分组中，方便以后恢复和识别历史数据；
+# 但不会进入服务端的可用目录、Prompt 候选或最终回复输出。`害羞/小动作`
+# 是前端对应的素材路径，而不是后端的另一个独立情绪 ID。
+TEMPORARILY_DISABLED_EMOTIONS: Tuple[str, ...] = ("害羞",)
+
 AVAILABLE_EMOTIONS: Tuple[str, ...] = tuple(
     emotion
     for group in EMOTION_GROUPS.values()
     for emotion in group
+    if emotion not in TEMPORARILY_DISABLED_EMOTIONS
 )

@@ -17,6 +17,7 @@ from ..domain.appraisal import (
     EventAppraisal, EventTriggerClass, event_appraisal_projector,
 )
 from kangel.integrations.ai.prompts import persona_qa_selector, streamer_reply_prompt_builder
+from kangel.integrations.ai.persona_context import runtime_persona_system
 
 
 @dataclass
@@ -165,6 +166,31 @@ class PersonaImpactAnalyzer:
                 danmaku_content, current_state, conversation_context
             )
     
+    def build_messages(
+        self,
+        danmaku_content: str,
+        current_state: PersonaState,
+        retrieved_qa: Optional[List[Dict]] = None,
+        conversation_context: Optional[Dict] = None,
+        activity_context: Optional[Dict] = None,
+        room_context: Optional[Dict] = None,
+        relationship_boundary: Optional[Dict] = None,
+    ) -> List[Dict[str, str]]:
+        """公开的纯渲染入口：与本轮真实调用逐字节同源，且不产生任何副作用。
+
+        提供离线人格一致性校验与只读渲染，保持与正式影响分析相同的 Prompt 来源；
+        不调用模型，不更新状态，只做委托而不重复格式化逻辑。
+        """
+        return self._build_analysis_prompt(
+            danmaku_content,
+            current_state,
+            retrieved_qa,
+            conversation_context,
+            activity_context=activity_context,
+            room_context=room_context,
+            relationship_boundary=relationship_boundary,
+        )
+
     def _build_analysis_prompt(
         self,
         danmaku_content: str,
@@ -178,7 +204,7 @@ class PersonaImpactAnalyzer:
         """构建分析提示词，包含主播的完整人格设定和RAG检索的QA参考"""
         
         # 获取系统提示词
-        system_prompt = streamer_reply_prompt_builder._build_system_prompt()
+        system_prompt = runtime_persona_system((activity_context or {}).get("_persona_stable_key", ""))
         
         qa_reference = streamer_reply_prompt_builder._format_retrieved_qa(retrieved_qa or [])
         qa_reference_section = (

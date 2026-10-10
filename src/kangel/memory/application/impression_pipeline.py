@@ -60,9 +60,17 @@ class DeepReflectionPipeline:
                 "SELECT 1 FROM sc_queue WHERE status IN ('pending', 'processing') LIMIT 1"
             ).fetchone() is not None
 
-    async def generate(self, claimed: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    async def generate(
+        self,
+        claimed: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        validator_feedback: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         try:
-            execution = _ReflectionExecution(self, claimed, snapshot)
+            execution = _ReflectionExecution(
+                self, claimed, snapshot, validator_feedback=validator_feedback
+            )
             return await execution.run()
         except (ImpressionPipelineError, asyncio.CancelledError):
             raise
@@ -73,10 +81,18 @@ class DeepReflectionPipeline:
 
 
 class _ReflectionExecution:
-    def __init__(self, pipeline: DeepReflectionPipeline, claimed, snapshot):
+    def __init__(
+        self,
+        pipeline: DeepReflectionPipeline,
+        claimed,
+        snapshot,
+        *,
+        validator_feedback: dict[str, str] | None = None,
+    ):
         self.pipeline = pipeline
         self.task = claimed
         self.snapshot = snapshot
+        self.validator_feedback = validator_feedback
         self.index = evidence_index(snapshot)
         self.config = snapshot["pipeline_config"]
         self.output_limit = effective_output_limit(snapshot)
@@ -120,7 +136,7 @@ class _ReflectionExecution:
             raise ImpressionPipelineError("stage_output_budget_exceeded")
         return normalized
 
-    async def stage(self, key, stage, payload, allowed):
+    async def stage(self, key, stage, payload, allowed, *, persist: bool = True):
         await self.guard()
         role = STAGE_ROLES[stage]
         if key not in self.cached:
@@ -163,13 +179,28 @@ class _ReflectionExecution:
             current_impression_stage.reset(stage_token)
         await self.guard()
         try:
-            output = self.validate(stage, parse_stage_json(result.get("reply", "")), allowed)
+            parsed = parse_stage_json(result.get("reply", ""))
         except Exception:
             impression_stage_metrics.validation(stage, "rejected")
+            # Keep the failure actionable without persisting model output or
+            # Pydantic's potentially private validation representation.
+            raise ImpressionPipelineError(f"{stage}_invalid_json") from None
+        try:
+            output = self.validate(stage, parsed, allowed)
+        except ImpressionPipelineError:
+            impression_stage_metrics.validation(stage, "rejected")
             raise
+        except Exception:
+            impression_stage_metrics.validation(stage, "rejected")
+            raise ImpressionPipelineError(f"{stage}_output_invalid") from None
         checkpoint = {"output": output, "provider": result.get("provider"), "model": result.get("model"),
                       "input_hash": input_hash,
                       "latency_ms": int((time.perf_counter() - started) * 1000)}
+        if not persist:
+            # A final-validator repair is intentionally ephemeral.  Persisting
+            # a rejected draft would make every retry replay the same invalid
+            # prose forever; the durable writer/critic checkpoints remain intact.
+            return checkpoint
         saved = await asyncio.to_thread(self.pipeline.database.save_viewer_impression_stage,
                                        **self.args(), stage_key=key, result=checkpoint)
         if not saved:
@@ -230,6 +261,23 @@ class _ReflectionExecution:
                 draft = await self.stage("repair", "repair", {
                     **critique_context, "critic": critic["output"],
                 }, allowed)
+        if self.validator_feedback:
+            # Final output validation happens in ViewerImpressionService because
+            # it owns the public letter contract. If that validator rejects the
+            # draft, run one bounded, ephemeral repair using only a stable,
+            # sanitized instruction. A retry gets a fresh repair attempt rather
+            # than repeatedly reusing rejected prose from writer/critic.
+            validator_context = {
+                **context,
+                "draft": draft["output"],
+                "draft_evidence": representative_excerpts(
+                    self.snapshot, draft["output"]["evidence_used"]
+                ),
+                "validator_feedback": self.validator_feedback,
+            }
+            draft = await self.stage(
+                "validator_repair", "repair", validator_context, allowed, persist=False
+            )
         await self.guard()
         return {"reply": json.dumps(draft["output"], ensure_ascii=False),
                 "provider": draft.get("provider"), "model": draft.get("model")}

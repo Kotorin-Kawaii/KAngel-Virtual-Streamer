@@ -4,6 +4,13 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 import re
 
 
+ProviderRole = Literal[
+    "default", "qa_selector", "danmaku_selector", "impact_analysis", "intent_shadow",
+    "moderation", "session_memory", "stream_director", "viewer_impression",
+    "viewer_memory_archaeologist", "viewer_impression_synthesizer", "viewer_impression_critic",
+]
+
+
 class ServerConfig(BaseSettings):
     """服务器配置"""
     host: str = "0.0.0.0"
@@ -32,7 +39,11 @@ class ProviderModelMapping(BaseModel):
 
 
 class ProviderReasoningMapping(BaseModel):
-    """按角色声明 reasoning 强度；只有供应商显式支持时才会发出。"""
+    """按角色声明 reasoning 强度；只有供应商显式支持时才会发出。
+
+    OpenAI 协议使用 ``reasoning_effort``，Gemini 协议使用
+    ``generationConfig.thinkingConfig.thinkingLevel``。
+    """
     default: Optional[Literal["off", "low", "medium", "high"]] = None
     qa_selector: Optional[Literal["off", "low", "medium", "high"]] = None
     danmaku_selector: Optional[Literal["off", "low", "medium", "high"]] = None
@@ -50,14 +61,33 @@ class ProviderReasoningMapping(BaseModel):
 class AIProvider(BaseModel):
     """单个模型供应商配置。
 
+    ``protocol`` 决定请求/响应协议：默认 ``openai`` 保持现有的
+    ``/chat/completions`` 兼容路径；``gemini`` 使用 Google 官方
+    ``generateContent`` REST API。两者共用同一套角色路由、权重、时间窗和
+    fallback 机制。
     weight 决定同时间段内优先级（降序），请求失败自动回退到下一供应商。
     active_start/active_end 为 HH:MM 本地时间，支持跨午夜（如 22:00-06:00）。
     """
     name: str = ""
     base_url: str = ""
     api_key: str = ""
+    proxy_url: Optional[str] = Field(
+        default=None,
+        description="该供应商专用 HTTP(S) 代理；未配置时直连且不继承进程代理环境变量",
+    )
+    roles: Optional[list[ProviderRole]] = Field(
+        default=None,
+        description="可服务的角色白名单；留空表示兼容旧行为、可参与全部已支持角色",
+    )
     models: ProviderModelMapping = Field(default_factory=ProviderModelMapping)
-    reasoning_protocol: Literal["none", "openai"] = "none"
+    protocol: Literal["openai", "gemini"] = Field(
+        default="openai",
+        description="请求协议；openai 为 Chat Completions，gemini 为 Google 官方 generateContent",
+    )
+    reasoning_protocol: Literal["none", "openai", "gemini"] = Field(
+        default="none",
+        description="reasoning 参数协议；应与 protocol 匹配且仅在显式声明时发送",
+    )
     reasoning: ProviderReasoningMapping = Field(default_factory=ProviderReasoningMapping)
     enabled: bool = True
     weight: int = Field(default=100, ge=0)
@@ -106,15 +136,23 @@ class AIModelPrice(BaseModel):
 
 
 class AIConfig(BaseSettings):
-    """OpenAI-compatible AI 服务配置。
+    """支持 OpenAI-compatible 与 Google Gemini 原生 REST 的 AI 服务配置。
 
     向后兼容：providers 为空时使用 base_url/api_key/default_model 单供应商模式。
     配置 providers 后，各调用点通过 role 而非 model 选择供应商链。
     """
     # —— 单供应商兼容字段（providers 为空时生效）——
-    base_url: str = Field(default="https://api.siliconflow.cn/v1", description="OpenAI-compatible API 基础URL")
+    base_url: str = Field(default="https://api.siliconflow.cn/v1", description="AI API 基础URL；由 protocol 决定请求协议")
     api_key: str = Field(default="", description="API密钥")
+    proxy_url: Optional[str] = Field(
+        default=None,
+        description="单供应商专用 HTTP(S) 代理；留空时直连",
+    )
     default_model: str = Field(default="Pro/MiniMaxAI/MiniMax-M2.5", description="默认模型")
+    protocol: Literal["openai", "gemini"] = Field(
+        default="openai",
+        description="单供应商请求协议；默认 OpenAI Chat Completions，可选 Google Gemini 原生 REST",
+    )
     qa_selector_model: Optional[str] = Field(default=None, description="QA选择器模型，留空时使用默认模型")
     qa_selector_timeout: int = Field(default=20, description="QA选择器API超时时间(秒)")
     danmaku_selector_model: Optional[str] = Field(default=None, description="弹幕候选选择模型，留空时使用默认模型")
@@ -204,7 +242,9 @@ class TokenAuditConfig(BaseSettings):
 
 class DanmakuConfig(BaseSettings):
     """弹幕配置"""
-    max_history: int = Field(default=50, description="最大历史弹幕数量")
+    # WebSocket 历史既用于新连接回放，也在进程重启后从 SQLite 恢复。
+    # 100 条足够覆盖短暂重启窗口，同时不会把整库内容带入内存。
+    max_history: int = Field(default=100, description="最大历史弹幕数量")
     message_rate_limit: int = Field(default=10, description="消息频率限制(条/分钟)")
     enable_filter: bool = Field(default=False, description="是否启用敏感词过滤")
     
@@ -406,11 +446,11 @@ class StreamConfig(BaseSettings):
     )
     mainline_theme_projection_enabled: bool = Field(
         default=False,
-        description="直播中用本场冻结快照改写公开的 daily_theme_*；默认关闭，旧字段仍跟随实时配置",
+        description="直播中投影本场冻结主题；Live Presence Active 自动生效，否则由本开关控制",
     )
     mainline_prompt_injection_enabled: bool = Field(
         default=False,
-        description="向人格 Prompt 注入本场主线事实；默认关闭，与回复计划注入同样按灰度开启",
+        description="向人格 Prompt 注入本场主线事实；Live Presence Active 自动生效，否则由本开关控制",
     )
     director_enabled: bool = Field(
         default=False,
@@ -450,6 +490,35 @@ class StreamConfig(BaseSettings):
         default=False,
         description="极少数主动模板台词允许 AI 单句润色；默认关闭",
     )
+    live_presence_enabled: bool = Field(
+        default=False,
+        description="P32-A 单场舞台即时状态层；默认关闭且不创建状态",
+    )
+    live_presence_shadow_enabled: bool = Field(
+        default=False,
+        description="P32-A 确定性 LiveAct Shadow 对照；需同时开启总开关",
+    )
+    live_presence_active_enabled: bool = Field(
+        default=False,
+        description="P32-B 允许 READ 后执行 ANSWER/IGNORE_AFTER_READ；默认关闭",
+    )
+    live_presence_thread_enabled: bool = False
+    live_presence_thread_opener_enabled: bool = False
+    live_presence_thread_suspend_active_enabled: bool = False
+    live_presence_thread_resume_active_enabled: bool = False
+    live_presence_thread_semantic_hint_enabled: bool = False
+    live_presence_thread_ttl_seconds: int = Field(default=300, ge=60, le=1800)
+    live_presence_thread_interval_seconds: int = Field(default=45, ge=15, le=300)
+    audience_presence_enabled: bool = Field(default=False, description="去重在线观众与进房问候 Shadow；启停 worker 需要重启")
+    audience_greeting_active_enabled: bool = Field(default=False, description="允许人格约束的单句进房问候，无次数预算")
+    audience_join_stable_seconds: float = Field(default=5, ge=0, le=30)
+    audience_greeting_candidate_ttl_seconds: float = Field(default=30, ge=5, le=120)
+    audience_greeting_viewer_cooldown_seconds: float = Field(default=900, ge=0, le=86400)
+    audience_greeting_global_cooldown_seconds: float = Field(default=60, ge=15, le=3600)
+    live_presence_self_talk_active_enabled: bool = Field(
+        default=False,
+        description="P32-C0 允许安静房间触发单轮模板 SELF_TALK；默认关闭",
+    )
     idle_state_min_duration_seconds: int = Field(default=60, ge=0, le=3600)
     language_detection_min_confidence: float = Field(default=0.65, ge=0.5, le=1.0)
     language_detection_min_script_chars: int = Field(default=3, ge=1, le=20)
@@ -459,6 +528,12 @@ class StreamConfig(BaseSettings):
     )
     english_surprise_joke_probability: float = Field(default=0.35, ge=0.0, le=1.0)
     english_surprise_joke_max_per_stream: int = Field(default=3, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def validate_audience_greeting_window(self) -> "StreamConfig":
+        if self.audience_join_stable_seconds >= self.audience_greeting_candidate_ttl_seconds:
+            raise ValueError("Audience 稳定时间必须小于问候候选 TTL")
+        return self
 
 
 class SessionSummaryConfig(BaseSettings):
@@ -515,7 +590,6 @@ class CORSConfig(BaseSettings):
     """浏览器跨域访问白名单；启用凭据时禁止使用通配来源。"""
     allowed_origins: list[str] = Field(default_factory=lambda: [
         "https://kotorin-kawaii.github.io",
-        "https://kangel.kotorin.cn",
         "http://localhost:5173",
         "http://localhost:3000",
     ])
@@ -804,13 +878,15 @@ class RateLimitConfig(BaseSettings):
     register_subnet_burst: int = Field(default=8, ge=1)
     register_global_rate_per_minute: float = Field(default=60.0, gt=0)
     register_global_burst: int = Field(default=20, ge=1)
-    login_ip_rate_per_minute: float = Field(default=20.0, gt=0)
-    login_ip_burst: int = Field(default=8, ge=1)
-    login_username_rate_per_minute: float = Field(default=5.0, gt=0)
-    login_username_burst: int = Field(default=3, ge=1)
-    login_global_rate_per_minute: float = Field(default=120.0, gt=0)
-    login_global_burst: int = Field(default=30, ge=1)
-    rejection_cooldown_seconds: int = Field(default=5, ge=0, le=3600)
+    # 登录允许正常的重复尝试，但仍保留 IP、用户名和全局三层令牌桶。
+    # 用户名桶此前只有 5/min、burst 3，连续重新登录很容易在第 4 次触发 429。
+    login_ip_rate_per_minute: float = Field(default=60.0, gt=0)
+    login_ip_burst: int = Field(default=20, ge=1)
+    login_username_rate_per_minute: float = Field(default=20.0, gt=0)
+    login_username_burst: int = Field(default=8, ge=1)
+    login_global_rate_per_minute: float = Field(default=300.0, gt=0)
+    login_global_burst: int = Field(default=60, ge=1)
+    rejection_cooldown_seconds: int = Field(default=2, ge=0, le=3600)
     register_hash_concurrency: int = Field(default=2, ge=1, le=64)
     login_hash_concurrency: int = Field(default=4, ge=1, le=128)
     login_failure_threshold: int = Field(default=3, ge=1, le=20)

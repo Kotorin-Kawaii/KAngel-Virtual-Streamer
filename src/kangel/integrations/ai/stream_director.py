@@ -10,7 +10,7 @@ from typing import Any
 
 from config import settings
 from kangel.infrastructure.bounded_work_gate import BoundedWorkGate, ai_reply_work_gate
-from kangel.integrations.ai.persona_card import build_system_persona_card
+from kangel.integrations.ai.persona_context import runtime_persona_system, runtime_persona_expression
 from kangel.integrations.ai.service import AIService, ai_service
 from kangel.stream.application.director import (
     ANIMATION_IDS,
@@ -99,7 +99,7 @@ class AIStreamDirectorCandidate:
             messages = [
                 {
                     "role": "system",
-                    "content": build_system_persona_card()[:700] + "\n"
+                    "content": runtime_persona_system(mainline.stream_session_id) + "\n"
                     "你是低频直播节奏候选器，不是人格核心。绝大多数情况输出 CONTINUE。"
                     "只能从 allowed 中选择，不能输出思维链、台词正文或新事实。",
                 },
@@ -166,7 +166,7 @@ class AIStreamDirectorCandidate:
             messages = [
                 {
                     "role": "system",
-                    "content": build_system_persona_card()[:700]
+                    "content": runtime_persona_system(mainline.stream_session_id)
                     + "\n只润色给定的一句公开台词，不改变含义，不宣布任何未提交变化。",
                 },
                 {
@@ -176,6 +176,11 @@ class AIStreamDirectorCandidate:
                         "emotion": emotion,
                         "committed_beat": mainline.current_beat_id,
                         "committed_activity": activity.activity_id,
+                        "persona_expression": runtime_persona_expression(mainline.stream_session_id,
+                            {key: context.get(key, default) for key, default in
+                             (("mood", .6), ("stress", .3), ("darkness", .2))},
+                            {key: context.get(key, default) for key, default in
+                             (("fatigue", .2), ("arousal", .5), ("attachment", .55), ("confidence", .65))}),
                         "output": {"text": "单句，最多100字符"},
                     }, ensure_ascii=False),
                 },
@@ -186,8 +191,14 @@ class AIStreamDirectorCandidate:
                 response_format={"type": "object"},
             )
             payload = self._parse_json(result.get("reply", ""))
-            text = " ".join(str(payload.get("text", "")).split())
-            if not text or len(text) > 100 or "\n" in text:
+            if set(payload) != {"text"} or not isinstance(payload["text"], str):
+                return None
+            text = payload["text"].strip()
+            if not text or len(text) > 100:
+                return None
+            from kangel.persona.application.stage_speech import validate_stage_result
+            public = {"emotions": [emotion], "sentences": [{"emotion": emotion, "text": text}]}
+            if validate_stage_result(json.dumps(public, ensure_ascii=False)) is None:
                 return None
             return text
         except Exception:
